@@ -31,7 +31,7 @@ format.quote-style = "single"
 
 [tool.ruff.lint]
 unfixable = ["F841"]
-ignore = ["UP015", "S311", "S101", "INP001", "SIM108", "ANN204"]
+ignore = ["UP015", "S311", "S101", "INP001", "SIM108", "ANN204", "SIM105"]
 task-tags = ["TODO"]
 select = [
     ## Here are all available rules

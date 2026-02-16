@@ -47,7 +47,8 @@ def simple_capture_profile(duration: int = 30):
 
     profiler.enable()
     try:
-        sniff(prn=packet_callback, store=0, filter='')
+        # Use same BPF filter as main app for consistency
+        sniff(prn=packet_callback, store=0, filter='tcp or udp or arp or icmp or icmp6')
     except KeyboardInterrupt:
         pass
     finally:

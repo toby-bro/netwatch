@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import contextlib
 import curses
 import functools
 import logging
@@ -15,7 +14,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from queue import Empty, Queue
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from scapy.all import get_if_addr, get_if_list, sniff
 from scapy.layers.dns import DNS
@@ -519,17 +518,17 @@ class NetWatch:
         initial_category: str,
         initial_info: str,
     ) -> None:
-        dns_layer_raw = pkt.getlayer(DNS)
-        if not dns_layer_raw:
+        dns_layer = pkt.getlayer(DNS)
+        if not dns_layer:
             try:
-                dns_layer_raw = DNS(pkt[UDP].payload)
+                dns_layer = DNS(pkt[UDP].payload)
             except (ValueError, IndexError, AttributeError):
-                dns_layer_raw = None
+                dns_layer = None
 
         category, info = initial_category, initial_info
-        if dns_layer_raw:
-            # Type-cast for mypy - we know it's DNS if not None
-            dns_layer: DNS = dns_layer_raw  # type: ignore[assignment]
+        if dns_layer:
+            if TYPE_CHECKING:
+                assert isinstance(dns_layer, DNS)
             try:
                 self._log_dns_questions(dns_layer, sip)
                 category, info = self._get_dns_category_info(dns_layer)
@@ -1056,15 +1055,19 @@ class NetWatch:
             if len(text) > max_x - 1:
                 text = text[: max_x - 1]
             attr = self._get_item_attr(item)
-            with contextlib.suppress(curses.error):
+            try:
                 stdscr.addstr(row_idx, 0, text, attr)
+            except curses.error:
+                pass
 
         if len(buffer) > visible_h:
             scroll_pct = self.scroll_offset / (len(buffer) - visible_h)
             scroll_pos = 3 + int(scroll_pct * (visible_h - 1))
             if scroll_pos < max_y:
-                with contextlib.suppress(curses.error):
+                try:
                     stdscr.addch(scroll_pos, max_x - 1, '█', curses.A_REVERSE)
+                except curses.error:
+                    pass
 
         stdscr.refresh()
 
