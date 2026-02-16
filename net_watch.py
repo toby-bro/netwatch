@@ -13,7 +13,6 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
 from scapy.all import get_if_addr, get_if_list, sniff
@@ -155,8 +154,8 @@ class NetWatch:
         self.connection_cache: dict[tuple[str, str, str, str, str], str] = {}
         # Note: No lock needed - dict ops are atomic in CPython
 
-        # Single writer command queue - all mutations go here
-        self.command_queue: Queue[dict[str, Any]] = Queue()
+        # Atomic command queue - list.append() and assignment are atomic in CPython
+        self.pending_commands: list[dict[str, Any]] = []
 
         # Display constants
         self.w_ip, self.w_info, self.w_age, self.w_ppm, self.w_proc = 38, 18, 6, 6, 18
@@ -325,8 +324,9 @@ class NetWatch:
         info: str,
         process: str = '',
     ) -> None:
-        """Queue an update for single writer thread."""
-        self.command_queue.put(
+        """Queue an update - uses atomic list.append() (no lock needed)."""
+        # list.append() is atomic in CPython due to GIL
+        self.pending_commands.append(
             {
                 'cmd': 'update',
                 'category': category,
@@ -338,36 +338,21 @@ class NetWatch:
         )
 
     def single_writer_worker(self) -> None:
-        """Single writer thread - ONLY thread that modifies self.data.
+        """Single writer thread - uses atomic list swap (zero locks).
 
-        All mutations go through command queue. This eliminates lock contention
-        because UI only reads (safe without locks in single-writer pattern).
+        List assignment is atomic in CPython, so we can swap the entire
+        command list without any locks.
         """
-        batch = []
-
         while True:
             try:
-                # Collect commands in batches for efficiency
-                try:
-                    cmd = self.command_queue.get(timeout=0.05)
-                    batch.append(cmd)
-                except Empty:
-                    if batch:
-                        self._process_command_batch(batch)
-                        batch = []
-                    continue
-
-                # Drain queue
-                while len(batch) < 100:  # Max batch size
-                    try:
-                        batch.append(self.command_queue.get_nowait())
-                    except Empty:
-                        break
-
-                # Process batch
+                # Atomic swap - grab current list and replace with empty one
+                # Both operations are atomic due to GIL
+                batch = self.pending_commands
                 if batch:
+                    self.pending_commands = []  # Atomic assignment
                     self._process_command_batch(batch)
-                    batch = []
+                else:
+                    time.sleep(0.01)  # Sleep if no work
 
             except Exception:
                 logging.error('Error in single writer', exc_info=True)
@@ -936,8 +921,14 @@ class NetWatch:
         Single writer pattern: UI thread ONLY reads, never writes.
         Cleanup is queued to single writer thread.
         """
-        # Queue cleanup command to single writer thread
-        self.command_queue.put({'cmd': 'cleanup', 'now': now})
+        # Queue cleanup only every 5th call to reduce overhead
+        if not hasattr(self, '_cleanup_counter'):
+            self._cleanup_counter = 0
+        self._cleanup_counter += 1
+
+        if self._cleanup_counter % 5 == 0:
+            # Atomic append - no lock needed
+            self.pending_commands.append({'cmd': 'cleanup', 'now': now})
 
         # Read data without lock - safe because only single writer modifies
         snapshot: list[tuple] = []
@@ -1118,7 +1109,7 @@ class NetWatch:
             self._draw_header(stdscr, len(buffer), now, max_x)
             self._draw_rows(stdscr, buffer, max_y, max_x)
 
-            time.sleep(0.15)  # Slower refresh = less lock contention
+            time.sleep(0.2)  # 200ms = 5fps, reduce CPU usage
 
     def run(self) -> None:
         self.detect_local_ips()
