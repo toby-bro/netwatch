@@ -51,7 +51,9 @@ class NetWatch:
 
         # IP Management
         self.my_ips: Set[str] = set()
-        self.ip_activity: Counter[str] = Counter()  # Track packet count to find "Main" IP
+        self.ip_activity: Counter[str] = (
+            Counter()
+        )  # Track packet count to find "Main" IP
 
         # Name Resolution
         self.resolved_names: Dict[str, Optional[str]] = {}
@@ -65,7 +67,9 @@ class NetWatch:
 
         # Display constants
         self.w_ip, self.w_info, self.w_age, self.w_ppm, self.w_proc = 38, 18, 6, 6, 18
-        self.cols_width = self.w_ip + self.w_info + self.w_age + self.w_ppm + self.w_proc + 13  # pipe chars
+        self.cols_width = (
+            self.w_ip + self.w_info + self.w_age + self.w_ppm + self.w_proc + 13
+        )  # pipe chars
 
     @staticmethod
     def is_private_ip(ip: str) -> bool:
@@ -218,7 +222,9 @@ class NetWatch:
             except Exception:
                 logging.error('Error in resolver worker', exc_info=True)
 
-    def update_entry(self, category: str, key: str, info: str, process: str = '') -> None:
+    def update_entry(
+        self, category: str, key: str, info: str, process: str = '',
+    ) -> None:
         now = time.time()
         with self.data_lock:
             if key not in self.data[category]:
@@ -275,7 +281,9 @@ class NetWatch:
             while q_rr:
                 qname = self.clean_mdns_name(q_rr.qname)
                 if qname:
-                    self.update_entry('mDNS Questions (Missing?)', f'{qname} [?]', f'Sought by {sip}')
+                    self.update_entry(
+                        'mDNS Questions (Missing?)', f'{qname} [?]', f'Sought by {sip}',
+                    )
                 q_rr = q_rr.payload
 
     def _get_dns_category_info(self, dns_layer: Any) -> tuple[str, str]:
@@ -289,7 +297,9 @@ class NetWatch:
             category = 'mDNS (Printer)'
         return category, info
 
-    def _process_dns_layer(self, pkt: Packet, sip: str, initial_category: str, initial_info: str) -> None:
+    def _process_dns_layer(
+        self, pkt: Packet, sip: str, initial_category: str, initial_info: str,
+    ) -> None:
         dns_layer = pkt.getlayer(DNS)
         if not dns_layer:
             try:
@@ -367,7 +377,9 @@ class NetWatch:
         process = self.get_process_for_port('tcp', local_port)
         return port, local_port, p_info, process
 
-    def _extract_udp_info(self, pkt: Packet, src_ip: str) -> tuple[str, str, str, str, bool]:
+    def _extract_udp_info(
+        self, pkt: Packet, src_ip: str,
+    ) -> tuple[str, str, str, str, bool]:
         """Extract UDP connection info and DNS flag."""
         is_my_src = src_ip in self.my_ips
         sport, dport = pkt[UDP].sport, pkt[UDP].dport
@@ -395,16 +407,22 @@ class NetWatch:
 
         if is_local_dns:
             # Group all local DNS into a single entry
-            self.update_entry('DNS Queries (Local)', 'Local DNS', 'Local DNS Queries', 'Various')
+            self.update_entry(
+                'DNS Queries (Local)', 'Local DNS', 'Local DNS Queries', 'Various',
+            )
         else:
             # Show detailed port-to-port info for other IPC
             key = f':{sport} > :{dport}'
             src_name = src_process if src_process else 'unknown'
             dst_name = dst_process if dst_process else 'unknown'
             process_flow = f'{src_name} → {dst_name}'
-            self.update_entry('Local Inter-Process', key, f'{proto.upper()} IPC', process_flow)
+            self.update_entry(
+                'Local Inter-Process', key, f'{proto.upper()} IPC', process_flow,
+            )
 
-    def _handle_active_connections(self, pkt: Packet, src_ip: Optional[str], dst_ip: Optional[str]) -> None:
+    def _handle_active_connections(
+        self, pkt: Packet, src_ip: Optional[str], dst_ip: Optional[str],
+    ) -> None:
         if not (src_ip and dst_ip):
             return
 
@@ -419,16 +437,23 @@ class NetWatch:
             if pkt.haslayer(TCP):
                 p_info = f':{pkt[TCP].sport} > :{pkt[TCP].dport}'
                 process = self.get_process_for_port(
-                    'tcp', str(pkt[TCP].sport if src_ip in self.my_ips else pkt[TCP].dport),
+                    'tcp',
+                    str(pkt[TCP].sport if src_ip in self.my_ips else pkt[TCP].dport),
                 )
             elif pkt.haslayer(UDP):
                 p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
                 process = self.get_process_for_port(
-                    'udp', str(pkt[UDP].sport if src_ip in self.my_ips else pkt[UDP].dport),
+                    'udp',
+                    str(pkt[UDP].sport if src_ip in self.my_ips else pkt[UDP].dport),
                 )
             else:
                 p_info, process = '', ''
-            self.update_entry('~ Ignored / Broadcast', f'{src_ip} > {dst_ip}', f'{proto.upper()} {p_info}', process)
+            self.update_entry(
+                '~ Ignored / Broadcast',
+                f'{src_ip} > {dst_ip}',
+                f'{proto.upper()} {p_info}',
+                process,
+            )
             return
 
         is_my_src = src_ip in self.my_ips
@@ -479,7 +504,12 @@ class NetWatch:
                 p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
             else:
                 p_info = ''
-            self.update_entry('~ Unclassified / Other Traffic', f'{src_ip} > {dst_ip}', f'{proto.upper()} {p_info}', '')
+            self.update_entry(
+                '~ Unclassified / Other Traffic',
+                f'{src_ip} > {dst_ip}',
+                f'{proto.upper()} {p_info}',
+                '',
+            )
 
     def parse_packet(self, pkt: Packet) -> None:
         src_ip = None
@@ -493,10 +523,20 @@ class NetWatch:
             dst_ip = pkt[IPv6].dst
 
         # Add local network IPs to my_ips set
-        if src_ip and src_ip not in self.my_ips and '.' in src_ip and self.is_private_ip(src_ip):
+        if (
+            src_ip
+            and src_ip not in self.my_ips
+            and '.' in src_ip
+            and self.is_private_ip(src_ip)
+        ):
             self.my_ips.add(src_ip)
 
-        if dst_ip and dst_ip not in self.my_ips and '.' in dst_ip and self.is_private_ip(dst_ip):
+        if (
+            dst_ip
+            and dst_ip not in self.my_ips
+            and '.' in dst_ip
+            and self.is_private_ip(dst_ip)
+        ):
             self.my_ips.add(dst_ip)
 
         if src_ip:
@@ -523,7 +563,15 @@ class NetWatch:
 
         # Check if name has mDNS-like patterns
         if resolved_name:
-            mdns_patterns = ['_on_', ' on ', '_mqtt_', '.local', 'mss_', '_printer_', '_iot_']
+            mdns_patterns = [
+                '_on_',
+                ' on ',
+                '_mqtt_',
+                '.local',
+                'mss_',
+                '_printer_',
+                '_iot_',
+            ]
             name_lower = resolved_name.lower()
             if any(pattern in name_lower for pattern in mdns_patterns):
                 return True
@@ -565,7 +613,9 @@ class NetWatch:
 
     def generate_table_string(self) -> str:
         lines = []
-        lines.append(f"{'DEVICE / IP':<38} | {'INFO':<18} | {'AGE':<6} | {'PPM':<6} | {'PROCESS':<18}")
+        lines.append(
+            f"{'DEVICE / IP':<38} | {'INFO':<18} | {'AGE':<6} | {'PPM':<6} | {'PROCESS':<18}",
+        )
         lines.append('-' * 100)
         with self.data_lock:
             now = time.time()
@@ -606,7 +656,9 @@ class NetWatch:
                 buffer.append({'type': 'spacer', 'text': '', 'is_new': False})
         return buffer
 
-    def _draw_header(self, stdscr: Any, buffer_len: int, now: float, max_x: int) -> None:
+    def _draw_header(
+        self, stdscr: Any, buffer_len: int, now: float, max_x: int,
+    ) -> None:
         try:
             mode_str = 'Passive' if self.passive_mode else 'Active'
             q_str = ' | Showing Queries' if self.show_questions else ''
@@ -615,7 +667,12 @@ class NetWatch:
 
             stdscr.addstr(0, 0, header[: max_x - 1], curses.A_BOLD)
             if now - self.status_time < 3 and self.status_msg:
-                stdscr.addstr(0, max_x - len(self.status_msg) - 1, self.status_msg, curses.A_REVERSE | curses.A_BOLD)
+                stdscr.addstr(
+                    0,
+                    max_x - len(self.status_msg) - 1,
+                    self.status_msg,
+                    curses.A_REVERSE | curses.A_BOLD,
+                )
 
             stdscr.addstr(
                 1,
@@ -640,7 +697,9 @@ class NetWatch:
             return curses.A_DIM
         return curses.A_NORMAL
 
-    def _draw_rows(self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, max_x: int) -> None:
+    def _draw_rows(
+        self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, max_x: int,
+    ) -> None:
         visible_h = max_y - 3
         if self.scroll_offset > max(0, len(buffer) - visible_h):
             self.scroll_offset = max(0, len(buffer) - visible_h)
@@ -673,7 +732,9 @@ class NetWatch:
 
         stdscr.refresh()
 
-    def _handle_input(self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, now: float) -> bool:
+    def _handle_input(
+        self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, now: float,
+    ) -> bool:
         try:
             ch = stdscr.getch()
             if ch == curses.KEY_DOWN:
@@ -728,7 +789,9 @@ class NetWatch:
 
     def run(self) -> None:
         self.detect_local_ips()
-        t_sniff = threading.Thread(target=lambda: sniff(prn=self.parse_packet, store=0, filter=''))
+        t_sniff = threading.Thread(
+            target=lambda: sniff(prn=self.parse_packet, store=0, filter=''),
+        )
         t_sniff.daemon = True
         t_sniff.start()
 
