@@ -1,422 +1,543 @@
 #!/usr/bin/env python3
-import time
-import threading
-import curses
 import argparse
-import socket
-import subprocess
-import shutil
+import curses
+import logging
 import os
+import socket
+import tempfile
+import threading
+import time
+from collections import Counter, defaultdict
 from datetime import datetime
-from queue import Queue, Empty
-from scapy.all import sniff, ARP, IP, IPv6, UDP, TCP, ICMP, DNS, Ether, DNSRR, get_if_list, get_if_addr, conf
-from collections import defaultdict, Counter
+from queue import Empty, Queue
+from typing import Any, DefaultDict, Dict, List, Optional, Set
+
+from scapy.all import get_if_addr, get_if_list, sniff
+from scapy.layers.dns import DNS
+from scapy.layers.inet import ICMP, IP, TCP, UDP
+from scapy.layers.inet6 import IPv6
+from scapy.layers.l2 import ARP, Ether
+
+# Configure logging
+logging.basicConfig(
+    filename=os.path.join(tempfile.gettempdir(), 'net_watch_debug.log'),
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
 
 # --- Configuration ---
 TIMEOUT = 60  # Memory duration in seconds
-PASSIVE_MODE = False 
-SHOW_QUESTIONS = False 
 
-# --- State Management ---
-data = defaultdict(dict)
-data_lock = threading.Lock()
-SCROLL_OFFSET = 0
-STATUS_MSG = ""
-STATUS_TIME = 0
 
-# IP Management
-MY_IPS = set()
-IP_ACTIVITY = Counter() # Track packet count per local IP to find the "Main" one
+class NetWatch:
+    def __init__(self, passive_mode: bool, show_questions: bool):
+        self.passive_mode = passive_mode
+        self.show_questions = show_questions
 
-# Name Resolution
-RESOLVED_NAMES = {} 
-RESOLVED_LOCK = threading.Lock()
-RESOLVER_QUEUE = Queue()
+        # --- State Management ---
+        self.data: DefaultDict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self.data_lock = threading.Lock()
+        self.scroll_offset = 0
+        self.status_msg = ''
+        self.status_time = 0.0
 
-def get_mac_vendor(mac):
-    if mac.startswith("00:04:96") or mac.startswith("00:e0:2b"): return "Extreme Networks"
-    if mac.startswith("0e:"): return "Extreme Protocol (EDP)"
-    if "cisco" in mac.lower(): return "Cisco"
-    return "Unknown Vendor"
+        # IP Management
+        self.my_ips: Set[str] = set()
+        self.ip_activity: Counter[str] = Counter()  # Track packet count to find "Main" IP
 
-def clean_mdns_name(name_input):
-    try:
-        # Handle bytes or string input safely
-        if isinstance(name_input, bytes):
-            name = name_input.decode('utf-8', errors='ignore')
-        else:
-            name = str(name_input)
+        # Name Resolution
+        self.resolved_names: Dict[str, Optional[str]] = {}
+        self.resolved_lock = threading.Lock()
+        self.resolver_queue: Queue[str] = Queue()
 
-        if name.endswith('.'): name = name[:-1]
-        
-        # Extract the human part from "Name._service._tcp.local"
-        if "._" in name: 
-            name = name.split("._")[0]
-            
-        if name.endswith(".local"): name = name[:-6]
-        
-        # Cleanup quotes sometimes found in TXT/Strings
-        name = name.strip('"')
-        
-        if len(name) < 2 or name.startswith("_"): return None
-        return name
-    except:
-        return None
+        # Display constants
+        self.w_ip, self.w_info, self.w_age, self.w_ppm = 45, 20, 6, 6
+        self.cols_width = self.w_ip + self.w_info + self.w_age + self.w_ppm + 9  # pipe chars
 
-def detect_local_ips():
-    """Enumerates all network interfaces to find local IPs."""
-    global MY_IPS
-    try:
-        for iface in get_if_list():
-            ip = get_if_addr(iface)
-            if ip and ip != "0.0.0.0" and not ip.startswith("127."):
-                MY_IPS.add(ip)
-    except:
-        pass
+    def get_mac_vendor(self, mac: str) -> str:
+        if mac.startswith(('00:04:96', '00:e0:2b')):
+            return 'Extreme Networks'
+        if mac.startswith('0e:'):
+            return 'Extreme Protocol (EDP)'
+        if 'cisco' in mac.lower():
+            return 'Cisco'
+        return 'Unknown Vendor'
 
-def get_main_ip():
-    """Returns the most active local IP."""
-    if not MY_IPS: return "Detecting..."
-    if not IP_ACTIVITY: return list(MY_IPS)[0]
-    return IP_ACTIVITY.most_common(1)[0][0]
-
-def resolver_worker():
-    while True:
+    def clean_mdns_name(self, name_input: Any) -> Optional[str]:
         try:
-            ip = RESOLVER_QUEUE.get(timeout=1)
-            with RESOLVED_LOCK:
-                if ip in RESOLVED_NAMES: continue
+            # Handle bytes or string input safely
+            if isinstance(name_input, bytes):
+                name = name_input.decode('utf-8', errors='ignore')
+            else:
+                name = str(name_input)
+
+            if name.endswith('.'):
+                name = name[:-1]
+
+            # Extract the human part from "Name._service._tcp.local"
+            if '._' in name:
+                name = name.split('._')[0]
+
+            if name.endswith('.local'):
+                name = name[:-6]
+
+            # Cleanup quotes sometimes found in TXT/Strings
+            name = name.strip('"')
+
+            if len(name) < 2 or name.startswith('_'):
+                return None
+            return name
+        except Exception:
+            logging.error('Error cleaning mDNS name', exc_info=True)
+            return None
+
+    def detect_local_ips(self) -> None:
+        """Enumerates all network interfaces to find local IPs."""
+        try:
+            for iface in get_if_list():
+                ip = get_if_addr(iface)
+                if ip and ip != '0.0.0.0' and not ip.startswith('127.'):  # noqa: S104
+                    self.my_ips.add(ip)
+        except Exception:
+            logging.error('Error detecting local IPs', exc_info=True)
+
+    def get_main_ip(self) -> str:
+        """Returns the most active local IP."""
+        if not self.my_ips:
+            return 'Detecting...'
+        if not self.ip_activity:
+            return next(iter(self.my_ips))
+        return self.ip_activity.most_common(1)[0][0]
+
+    def resolver_worker(self) -> None:
+        while True:
             try:
-                hostname, _, _ = socket.gethostbyaddr(ip)
-                with RESOLVED_LOCK: RESOLVED_NAMES[ip] = hostname
-            except:
-                with RESOLVED_LOCK: RESOLVED_NAMES[ip] = None 
-        except Empty: continue
-        except: pass
+                ip = self.resolver_queue.get(timeout=1)
+                with self.resolved_lock:
+                    if ip in self.resolved_names:
+                        continue
+                try:
+                    hostname, _, _ = socket.gethostbyaddr(ip)
+                    with self.resolved_lock:
+                        self.resolved_names[ip] = hostname
+                except Exception:
+                    with self.resolved_lock:
+                        self.resolved_names[ip] = None
+            except Empty:
+                continue
+            except Exception:
+                logging.error('Error in resolver worker', exc_info=True)
 
-def update_entry(category, key, info):
-    now = time.time()
-    with data_lock:
-        if key not in data[category]:
-            data[category][key] = {'last_seen': now, 'first_seen': now, 'count': 0, 'info': info}
-        entry = data[category][key]
-        entry['last_seen'] = now
-        entry['count'] += 1
-        if entry['info'] == "Multicast DNS" and info != "Multicast DNS":
-            entry['info'] = info
+    def update_entry(self, category: str, key: str, info: str) -> None:
+        now = time.time()
+        with self.data_lock:
+            if key not in self.data[category]:
+                self.data[category][key] = {'last_seen': now, 'first_seen': now, 'count': 0, 'info': info}
+            entry = self.data[category][key]
+            entry['last_seen'] = now
+            entry['count'] += 1
+            if entry['info'] == 'Multicast DNS' and info != 'Multicast DNS':
+                entry['info'] = info
 
-def parse_packet(pkt):
-    global MY_IPS
-    now = time.time()
-    
-    # Check IP Layer (IPv4 or IPv6)
-    src_ip = None
-    dst_ip = None
-    
-    if pkt.haslayer(IP):
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-    elif pkt.haslayer(IPv6):
-        src_ip = pkt[IPv6].src
-        dst_ip = pkt[IPv6].dst
-        
-    if src_ip:
-        # Passive IP detection fallback
-        if src_ip not in MY_IPS and "." in src_ip: 
-            if src_ip.startswith("192.168.") or src_ip.startswith("10."):
-                MY_IPS.add(src_ip)
+    def _extract_name_from_rr(self, rr: Any) -> Optional[str]:
+        extracted = None
+        # PTR (12), TXT (16), SRV (33), A (1), AAAA (28)
+        if rr.type == 12:
+            extracted = self.clean_mdns_name(rr.rdata)
+        elif rr.type == 16 or rr.type == 33 or rr.type in [1, 28]:
+            extracted = self.clean_mdns_name(rr.rrname)
+            if rr.type == 33 and not extracted:
+                extracted = self.clean_mdns_name(rr.target)
+        return extracted
 
-        # Track Activity
-        if src_ip in MY_IPS: IP_ACTIVITY[src_ip] += 1
-        if dst_ip and dst_ip in MY_IPS: IP_ACTIVITY[dst_ip] += 1
+    def _update_resolved_name(self, sip: str, extracted: str) -> None:
+        with self.resolved_lock:
+            prev = self.resolved_names.get(sip)
+            if not prev or (len(extracted) > len(prev) and '._' not in extracted):
+                self.resolved_names[sip] = extracted
 
-    # 1. ARP
-    if pkt.haslayer(ARP):
-        ident = f"{pkt[ARP].psrc} ({pkt[ARP].hwsrc})"
-        update_entry('ARP_Neighbors', ident, "ARP Announcement")
-        if not PASSIVE_MODE: RESOLVER_QUEUE.put(pkt[ARP].psrc)
+    def _scan_dns_records(self, dns_layer: Any, sip: str) -> None:
+        scan_lists = []
+        if dns_layer.an:
+            scan_lists.append(dns_layer.an)
+        if dns_layer.ar:
+            scan_lists.append(dns_layer.ar)
 
-    # 2. mDNS
-    if pkt.haslayer(UDP) and pkt.dport == 5353:
-        sip = pkt[IP].src if pkt.haslayer(IP) else pkt[IPv6].src if pkt.haslayer(IPv6) else "Unknown"
-        category, info = "mDNS (General)", "Multicast DNS"
-        
-        # Force DNS decoding if Scapy missed it
+        for rr_start in scan_lists:
+            rr = rr_start
+            while rr:
+                extracted = self._extract_name_from_rr(rr)
+                if extracted:
+                    self._update_resolved_name(sip, extracted)
+                rr = rr.payload
+
+    def _log_dns_questions(self, dns_layer: Any, sip: str) -> None:
+        if self.show_questions and dns_layer.qd:
+            q_rr = dns_layer.qd
+            while q_rr:
+                qname = self.clean_mdns_name(q_rr.qname)
+                if qname:
+                    self.update_entry('mDNS Questions (Missing?)', f'{qname} [?]', f'Sought by {sip}')
+                q_rr = q_rr.payload
+
+    def _get_dns_category_info(self, dns_layer: Any) -> tuple[str, str]:
+        category, info = 'mDNS (General)', 'Multicast DNS'
+        raw_dns = bytes(dns_layer)
+        if b'_airplay' in raw_dns or b'_companion-link' in raw_dns:
+            category, info = 'mDNS (Apple Device)', 'AirPlay/Handoff'
+        elif b'_googlecast' in raw_dns:
+            category = 'mDNS (Google/Android)'
+        elif b'_printer' in raw_dns or b'_ipp' in raw_dns:
+            category = 'mDNS (Printer)'
+        return category, info
+
+    def _process_dns_layer(self, pkt: Any, sip: str, initial_category: str, initial_info: str) -> None:
         dns_layer = pkt.getlayer(DNS)
         if not dns_layer:
             try:
                 dns_layer = DNS(pkt[UDP].payload)
-            except:
+            except Exception:
                 dns_layer = None
 
+        category, info = initial_category, initial_info
         if dns_layer:
             try:
-                if SHOW_QUESTIONS and dns_layer.qd:
-                    q_rr = dns_layer.qd
-                    while q_rr:
-                        qname = clean_mdns_name(q_rr.qname)
-                        if qname: update_entry('mDNS Questions (Missing?)', f"{qname} [?]", f"Sought by {sip}")
-                        q_rr = q_rr.payload
+                self._log_dns_questions(dns_layer, sip)
+                category, info = self._get_dns_category_info(dns_layer)
+                self._scan_dns_records(dns_layer, sip)
+            except Exception:
+                logging.error('Error processing DNS layer', exc_info=True)
+        self.update_entry(category, sip, info)
 
-                raw_dns = bytes(dns_layer)
-                if b'_airplay' in raw_dns or b'_companion-link' in raw_dns: category, info = "mDNS (Apple Device)", "AirPlay/Handoff"
-                elif b'_googlecast' in raw_dns: category = "mDNS (Google/Android)"
-                elif b'_printer' in raw_dns or b'_ipp' in raw_dns: category = "mDNS (Printer)"
+    def _handle_arp(self, pkt: Any) -> None:
+        if pkt.haslayer(ARP):
+            ident = f'{pkt[ARP].psrc} ({pkt[ARP].hwsrc})'
+            self.update_entry('ARP_Neighbors', ident, 'ARP Announcement')
+            if not self.passive_mode:
+                self.resolver_queue.put(pkt[ARP].psrc)
 
-                # Scan ALL records (Answers + Additional)
-                scan_lists = []
-                if dns_layer.an: scan_lists.append(dns_layer.an)
-                if dns_layer.ar: scan_lists.append(dns_layer.ar)
-                
-                for rr in scan_lists:
-                    while rr:
-                        extracted = None
-                        
-                        # PTR (12): Name is in RDATA
-                        if rr.type == 12: 
-                            extracted = clean_mdns_name(rr.rdata)
-                        
-                        # TXT (16): Name is in RRNAME (The record name itself)
-                        elif rr.type == 16:
-                            extracted = clean_mdns_name(rr.rrname)
+    def _handle_mdns(self, pkt: Any, sip: str) -> None:
+        if pkt.haslayer(UDP) and (pkt.dport == 5353 or pkt.sport == 5353):
+            category, info = 'mDNS (General)', 'Multicast DNS'
+            self._process_dns_layer(pkt, sip, category, info)
 
-                        # SRV (33): Name is in RRNAME (preferred) or TARGET (fallback)
-                        elif rr.type == 33:
-                            extracted = clean_mdns_name(rr.rrname)
-                            if not extracted:
-                                extracted = clean_mdns_name(rr.target)
-                            
-                        # A (1) / AAAA (28): Name is in RRNAME
-                        elif rr.type in [1, 28]:
-                            extracted = clean_mdns_name(rr.rrname)
+    def _handle_windows(self, pkt: Any, sip: str) -> None:
+        if pkt.haslayer(UDP):
+            if pkt.dport == 1900:
+                self.update_entry('Windows/UPnP', sip, 'SSDP Discovery')
+            elif pkt.dport == 5355:
+                self.update_entry('Windows/LLMNR', sip, 'LLMNR Proxy Search')
+            elif pkt.dport == 137:
+                self.update_entry('Windows/NetBIOS', sip, 'Name Query')
 
-                        # Update if valid name found
-                        if extracted: 
-                            with RESOLVED_LOCK: 
-                                prev = RESOLVED_NAMES.get(sip)
-                                # Overwrite if new name is longer/better (e.g. switch from "Host.local" to "My MacBook")
-                                if not prev or (len(extracted) > len(prev) and "._" not in extracted):
-                                    RESOLVED_NAMES[sip] = extracted
-                        
-                        rr = rr.payload
-            except: pass
-        update_entry(category, sip, info)
+            if not self.passive_mode and '.' in sip and pkt.dport in [1900, 5355, 137]:
+                self.resolver_queue.put(sip)
 
-    # 3. Windows
-    if pkt.haslayer(UDP):
-        sip = pkt[IP].src if pkt.haslayer(IP) else pkt[IPv6].src if pkt.haslayer(IPv6) else "Unknown"
-        if pkt.dport == 1900:
-            update_entry('Windows/UPnP', sip, "SSDP Discovery")
-            if not PASSIVE_MODE and "." in sip: RESOLVER_QUEUE.put(sip)
-        elif pkt.dport == 5355:
-            update_entry('Windows/LLMNR', sip, "LLMNR Proxy Search")
-            if not PASSIVE_MODE and "." in sip: RESOLVER_QUEUE.put(sip)
-        elif pkt.dport == 137:
-            update_entry('Windows/NetBIOS', sip, "Name Query")
-            if not PASSIVE_MODE and "." in sip: RESOLVER_QUEUE.put(sip)
+    def _handle_steam(self, pkt: Any, sip: str) -> None:
+        if pkt.haslayer(UDP):
+            try:
+                if pkt.dport == 27036 or b'STEAM' in bytes(pkt[UDP].payload):
+                    self.update_entry('Steam_Gamers', sip, 'Steam LAN Discovery')
+                    if not self.passive_mode and '.' in sip:
+                        self.resolver_queue.put(sip)
+            except Exception:
+                logging.error('Error parsing Steam packet', exc_info=True)
 
-    # 4. Steam
-    if pkt.haslayer(UDP):
+    def _handle_infra(self, pkt: Any) -> None:
+        if pkt.haslayer(Ether):
+            mac_src = pkt[Ether].src
+            vendor = self.get_mac_vendor(mac_src)
+            if 'Extreme' in vendor or mac_src.startswith('0e:'):
+                self.update_entry('Infrastructure', mac_src, vendor)
+            if pkt.haslayer('Dot3') or pkt.type == 0x88CC:
+                self.update_entry('Infrastructure', mac_src, 'Switch/Router (LLDP)')
+
+    def _handle_ping(self, pkt: Any) -> None:
+        if pkt.haslayer(ICMP) and pkt.haslayer(IP):
+            if pkt[IP].dst in self.my_ips and pkt[ICMP].type == 8:
+                self.update_entry('Pinging_Me', pkt[IP].src, 'ICMP Echo Request')
+                if not self.passive_mode:
+                    self.resolver_queue.put(pkt[IP].src)
+
+    def _handle_active_connections(self, pkt: Any, src_ip: Optional[str], dst_ip: Optional[str]) -> None:
+        if src_ip and dst_ip:
+            if pkt.haslayer(UDP) and pkt.dport in [5353, 1900, 5355, 137, 27036]:
+                return
+
+            is_ignored = False
+            if dst_ip.endswith('.255') or dst_ip.startswith(('224.', '239.', 'ff02:')):
+                is_ignored = True
+
+            proto = 'TCP' if pkt.haslayer(TCP) else 'UDP' if pkt.haslayer(UDP) else 'IP'
+            port = ''
+            p_info = ''
+
+            if pkt.haslayer(TCP):
+                port = f':{pkt[TCP].dport}' if src_ip in self.my_ips else f':{pkt[TCP].sport}'
+                p_info = f':{pkt[TCP].sport} > :{pkt[TCP].dport}'
+            elif pkt.haslayer(UDP):
+                port = f':{pkt[UDP].dport}' if src_ip in self.my_ips else f':{pkt[UDP].sport}'
+                p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
+
+            if is_ignored:
+                key = f'{src_ip} > {dst_ip}'
+                self.update_entry('~ Ignored / Broadcast', key, f'{proto} {p_info}')
+                return
+
+            is_my_src = src_ip in self.my_ips
+            is_my_dst = dst_ip in self.my_ips
+
+            if is_my_src or is_my_dst:
+                other_ip = dst_ip if is_my_src else src_ip
+                if not self.passive_mode and '.' in other_ip:
+                    self.resolver_queue.put(other_ip)
+                self.update_entry('Active_Connections', f'{other_ip}{port}', f'{proto} Traffic')
+            else:
+                key = f'{src_ip} > {dst_ip}'
+                self.update_entry('~ Unclassified / Other Traffic', key, f'{proto} {p_info}')
+
+    def parse_packet(self, pkt: Any) -> None:
+        src_ip = None
+        dst_ip = None
+
+        if pkt.haslayer(IP):
+            src_ip = pkt[IP].src
+            dst_ip = pkt[IP].dst
+        elif pkt.haslayer(IPv6):
+            src_ip = pkt[IPv6].src
+            dst_ip = pkt[IPv6].dst
+
+        if src_ip:
+            if src_ip not in self.my_ips and '.' in src_ip:
+                if src_ip.startswith(('192.168.', '10.')):
+                    self.my_ips.add(src_ip)
+
+            if src_ip in self.my_ips:
+                self.ip_activity[src_ip] += 1
+            if dst_ip and dst_ip in self.my_ips:
+                self.ip_activity[dst_ip] += 1
+
+        sip = src_ip if src_ip else 'Unknown'
+
+        self._handle_arp(pkt)
+        self._handle_mdns(pkt, sip)
+        self._handle_windows(pkt, sip)
+        self._handle_steam(pkt, sip)
+        self._handle_infra(pkt)
+        self._handle_ping(pkt)
+        self._handle_active_connections(pkt, src_ip, dst_ip)
+
+    def get_display_name(self, key: str) -> str:
+        if '>' in key:
+            return key
+        ip_part = key.split(':', maxsplit=1)[0].split(' ')[0]
+        with self.resolved_lock:
+            name = self.resolved_names.get(ip_part)
+            if name:
+                if key == ip_part:
+                    return f'{name} ({ip_part})'
+                return f"{name} {key.replace(ip_part, '')}"
+        return key
+
+    def truncate(self, text: str, width: int) -> str:
+        if len(text) > width:
+            return text[: width - 3] + '...'
+        return text
+
+    def save_to_file(self, text: str) -> Optional[str]:
         try:
-            if pkt.dport == 27036 or b'STEAM' in bytes(pkt[UDP].payload):
-                sip = pkt[IP].src if pkt.haslayer(IP) else pkt[IPv6].src if pkt.haslayer(IPv6) else "Unknown"
-                update_entry('Steam_Gamers', sip, "Steam LAN Discovery")
-                if not PASSIVE_MODE and "." in sip: RESOLVER_QUEUE.put(sip)
-        except: pass
+            log_dir = os.path.join(tempfile.gettempdir(), 'net_watch')
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir)
 
-    # 5. Infra
-    if pkt.haslayer(Ether):
-        mac_src = pkt[Ether].src
-        if "Extreme" in get_mac_vendor(mac_src) or mac_src.startswith("0e:"):
-            update_entry('Infrastructure', mac_src, get_mac_vendor(mac_src))
-        if pkt.haslayer("Dot3") or pkt.type == 0x88cc:
-             update_entry('Infrastructure', mac_src, "Switch/Router (LLDP)")
+            ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+            filename = os.path.join(log_dir, f'{ts}.log')
 
-    # 6. Ping
-    if pkt.haslayer(ICMP) and pkt.haslayer(IP):
-        if pkt[IP].dst in MY_IPS and pkt[ICMP].type == 8:
-            update_entry('Pinging_Me', pkt[IP].src, "ICMP Echo Request")
-            if not PASSIVE_MODE: RESOLVER_QUEUE.put(pkt[IP].src)
+            with open(filename, 'w') as f:
+                f.write(text)
+            return filename
+        except Exception:
+            logging.error('Error saving to file', exc_info=True)
+            return None
 
-    # 7. Active & Catch-all Connections (IPv4 & IPv6)
-    if src_ip and dst_ip:
-        # Don't double-log things already handled by parsers above
-        if pkt.haslayer(UDP) and pkt.dport in [5353, 1900, 5355, 137, 27036]: return
-
-        # Check for Broadcast/Multicast (Ignored Traffic)
-        is_ignored = False
-        if dst_ip.endswith(".255") or dst_ip.startswith("224.") or dst_ip.startswith("239."): is_ignored = True
-        if dst_ip.startswith("ff02:"): is_ignored = True
-
-        proto = "TCP" if pkt.haslayer(TCP) else "UDP" if pkt.haslayer(UDP) else "IP"
-        port = ""
-        p_info = ""
-        
-        if pkt.haslayer(TCP): 
-            port = f":{pkt[TCP].dport}" if src_ip in MY_IPS else f":{pkt[TCP].sport}"
-            p_info = f":{pkt[TCP].sport} > :{pkt[TCP].dport}"
-        elif pkt.haslayer(UDP): 
-            port = f":{pkt[UDP].dport}" if src_ip in MY_IPS else f":{pkt[UDP].sport}"
-            p_info = f":{pkt[UDP].sport} > :{pkt[UDP].dport}"
-
-        if is_ignored:
-            # Log as "Ignored" so user can see it
-            key = f"{src_ip} > {dst_ip}"
-            update_entry('~ Ignored / Broadcast', key, f"{proto} {p_info}")
-            return # Don't process as active connection
-
-        is_my_src = src_ip in MY_IPS
-        is_my_dst = dst_ip in MY_IPS
-        
-        if is_my_src or is_my_dst:
-            # Active Connection (Me involved)
-            other_ip = dst_ip if is_my_src else src_ip
-            if not PASSIVE_MODE and "." in other_ip: RESOLVER_QUEUE.put(other_ip)
-            update_entry('Active_Connections', f"{other_ip}{port}", f"{proto} Traffic")
-        else:
-            # Catch-all (Interception/Promiscuous)
-            key = f"{src_ip} > {dst_ip}"
-            update_entry('~ Unclassified / Other Traffic', key, f"{proto} {p_info}")
-
-def get_display_name(key):
-    if ">" in key: return key 
-    ip_part = key.split(':')[0].split(' ')[0]
-    with RESOLVED_LOCK:
-        name = RESOLVED_NAMES.get(ip_part)
-        if name:
-            if key == ip_part: return f"{name} ({ip_part})"
-            else: return f"{name} {key.replace(ip_part, '')}"
-    return key
-
-def truncate(text, width):
-    if len(text) > width: return text[:width-3] + "..."
-    return text
-
-def save_to_file(text):
-    try:
-        log_dir = "/tmp/net_watch"
-        if not os.path.exists(log_dir): os.makedirs(log_dir)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"{log_dir}/{ts}.log"
-        with open(filename, "w") as f: f.write(text)
-        return filename
-    except: return None
-
-def generate_table_string():
-    lines = []
-    lines.append(f"{'DEVICE / IP':<45} | {'INFO':<20} | {'AGE':<6} | {'PPM':<6}")
-    lines.append("-" * 85)
-    with data_lock:
-        now = time.time()
-        for cat in sorted(data.keys()):
-            lines.append(f"[{cat}]")
-            for key, details in data[cat].items():
-                name = get_display_name(key)
-                age = int(now - details['last_seen'])
-                duration = max(1, now - details['first_seen'])
-                ppm = int((details['count'] / duration) * 60)
-                lines.append(f"  {name:<45} | {details['info']:<20} | {age:<6} | {ppm:<6}")
-            lines.append("")
-    return "\n".join(lines)
-
-def cleanup_and_display(stdscr):
-    global SCROLL_OFFSET, STATUS_MSG, STATUS_TIME
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.keypad(True) 
-    W_IP, W_INFO, W_AGE, W_PPM = 45, 20, 6, 6
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        now = time.time()
-        with data_lock:
-            for category in list(data.keys()):
-                for key in list(data[category].keys()):
-                    if now - data[category][key]['last_seen'] > TIMEOUT:
-                        del data[category][key]
-                if not data[category]: del data[category]
-
-        buffer = []
-        with data_lock:
-            for cat in sorted(data.keys()):
-                buffer.append({'type': 'cat', 'text': f"[{cat}]"})
-                for key, details in data[cat].items():
+    def generate_table_string(self) -> str:
+        lines = []
+        lines.append(f"{'DEVICE / IP':<45} | {'INFO':<20} | {'AGE':<6} | {'PPM':<6}")
+        lines.append('-' * 85)
+        with self.data_lock:
+            now = time.time()
+            for cat in sorted(self.data.keys()):
+                lines.append(f'[{cat}]')
+                for key, details in self.data[cat].items():
+                    name = self.get_display_name(key)
                     age = int(now - details['last_seen'])
                     duration = max(1, now - details['first_seen'])
                     ppm = int((details['count'] / duration) * 60)
-                    display_key = get_display_name(key)
-                    t_key = truncate(display_key, W_IP)
-                    t_info = truncate(details['info'], W_INFO)
-                    line_str = f"  {t_key:<{W_IP}} | {t_info:<{W_INFO}} | {age:<{W_AGE}} | {ppm:<{W_PPM}}"
-                    buffer.append({'type': 'row', 'text': line_str, 'is_new': age < 5})
-                buffer.append({'type': 'spacer', 'text': ''})
+                    lines.append(f"  {name:<45} | {details['info']:<20} | {age:<6} | {ppm:<6}")
+                lines.append('')
+        return '\n'.join(lines)
 
+    def _prepare_buffer(self) -> List[Dict[str, Any]]:
+        buffer = []
+        now = time.time()
+        with self.data_lock:
+            for cat in sorted(self.data.keys()):
+                buffer.append({'type': 'cat', 'text': f'[{cat}]', 'is_new': False})
+                for key, details in self.data[cat].items():
+                    age = int(now - details['last_seen'])
+                    duration = max(1, now - details['first_seen'])
+                    ppm = int((details['count'] / duration) * 60)
+                    display_key = self.get_display_name(key)
+                    t_key = self.truncate(display_key, self.w_ip)
+                    t_info = self.truncate(details['info'], self.w_info)
+                    line_str = (
+                        f'  {t_key:<{self.w_ip}} | {t_info:<{self.w_info}} | {age:<{self.w_age}} | {ppm:<{self.w_ppm}}'
+                    )
+                    buffer.append({'type': 'row', 'text': line_str, 'is_new': age < 5})
+                buffer.append({'type': 'spacer', 'text': '', 'is_new': False})
+        return buffer
+
+    def _draw_header(self, stdscr: Any, buffer_len: int, now: float, max_x: int) -> None:
+        try:
+            mode_str = 'Passive' if self.passive_mode else 'Active'
+            q_str = ' | Showing Queries' if self.show_questions else ''
+            main_ip = self.get_main_ip()
+            header = f"NET MONITOR ({mode_str}{q_str}) [Press 'p' to Save Log]"
+
+            stdscr.addstr(0, 0, header[: max_x - 1], curses.A_BOLD)
+            if now - self.status_time < 3 and self.status_msg:
+                stdscr.addstr(0, max_x - len(self.status_msg) - 1, self.status_msg, curses.A_REVERSE | curses.A_BOLD)
+
+            stdscr.addstr(
+                1,
+                0,
+                f'Main IP: {main_ip} (Total IPs: {len(self.my_ips)}) | Timeout: {TIMEOUT}s | Items: {buffer_len}',
+                curses.A_DIM,
+            )
+            cols = (
+                f"  {'DEVICE / IP':<{self.w_ip}} | {'INFO':<{self.w_info}} | "
+                f"{'AGE':<{self.w_age}} | {'PPM':<{self.w_ppm}}"
+            )
+            stdscr.addstr(2, 0, cols[: max_x - 1], curses.A_REVERSE)
+        except Exception:  # noqa: S110
+            pass  # Small terminal
+
+    def _get_item_attr(self, item: Dict[str, Any]) -> int:
+        if item['type'] == 'cat':
+            return curses.A_BOLD | curses.A_UNDERLINE
+        if item['type'] == 'row' and item.get('is_new'):
+            return curses.A_BOLD
+        if item['type'] == 'row':
+            return curses.A_DIM
+        return curses.A_NORMAL
+
+    def _draw_rows(self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, max_x: int) -> None:
+        visible_h = max_y - 3
+        if self.scroll_offset > max(0, len(buffer) - visible_h):
+            self.scroll_offset = max(0, len(buffer) - visible_h)
+
+        slice_end = min(len(buffer), self.scroll_offset + visible_h)
+
+        for i in range(self.scroll_offset, slice_end):
+            row_idx = i - self.scroll_offset + 3
+            if row_idx >= max_y:
+                break
+
+            item = buffer[i]
+            text = item['text']
+            if len(text) > max_x - 1:
+                text = text[: max_x - 1]
+            attr = self._get_item_attr(item)
+            try:
+                stdscr.addstr(row_idx, 0, text, attr)
+            except Exception:  # noqa: S110
+                pass
+
+        if len(buffer) > visible_h:
+            scroll_pct = self.scroll_offset / (len(buffer) - visible_h)
+            scroll_pos = 3 + int(scroll_pct * (visible_h - 1))
+            if scroll_pos < max_y:
+                try:
+                    stdscr.addch(scroll_pos, max_x - 1, '█', curses.A_REVERSE)
+                except Exception:  # noqa: S110
+                    pass
+
+        stdscr.refresh()
+
+    def _handle_input(self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, now: float) -> bool:
         try:
             ch = stdscr.getch()
             if ch == curses.KEY_DOWN:
-                if SCROLL_OFFSET < len(buffer) - (max_y - 4): SCROLL_OFFSET += 1
+                if self.scroll_offset < len(buffer) - (max_y - 4):
+                    self.scroll_offset += 1
             elif ch == curses.KEY_UP:
-                if SCROLL_OFFSET > 0: SCROLL_OFFSET -= 1
+                if self.scroll_offset > 0:
+                    self.scroll_offset -= 1
             elif ch == ord('p'):
-                full_table = generate_table_string()
-                saved_path = save_to_file(full_table)
-                if saved_path: STATUS_MSG, STATUS_TIME = f"SAVED TO {saved_path}", now
-                else: STATUS_MSG, STATUS_TIME = "SAVE FAILED", now
-            elif ch == ord('q'): break
-        except: pass
+                full_table = self.generate_table_string()
+                saved_path = self.save_to_file(full_table)
+                if saved_path:
+                    self.status_msg, self.status_time = f'SAVED TO {saved_path}', now
+                else:
+                    self.status_msg, self.status_time = 'SAVE FAILED', now
+            elif ch == ord('q'):
+                return False
+        except Exception:  # noqa: S110
+            pass
+        return True
 
-        stdscr.erase()
-        mode_str = "Passive" if PASSIVE_MODE else "Active"
-        q_str = " | Showing Queries" if SHOW_QUESTIONS else ""
-        main_ip = get_main_ip()
-        header = f"NET MONITOR ({mode_str}{q_str}) [Press 'p' to Save Log]"
-        stdscr.addstr(0, 0, header[:max_x-1], curses.A_BOLD)
-        if now - STATUS_TIME < 3 and STATUS_MSG:
-            stdscr.addstr(0, max_x - len(STATUS_MSG) - 1, STATUS_MSG, curses.A_REVERSE | curses.A_BOLD)
-        stdscr.addstr(1, 0, f"Main IP: {main_ip} (Total IPs: {len(MY_IPS)}) | Timeout: {TIMEOUT}s | Items: {len(buffer)}", curses.A_DIM)
-        cols = f"  {'DEVICE / IP':<{W_IP}} | {'INFO':<{W_INFO}} | {'AGE':<{W_AGE}} | {'PPM':<{W_PPM}}"
-        stdscr.addstr(2, 0, cols[:max_x-1], curses.A_REVERSE)
+    def cleanup_and_display(self, stdscr: Any) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
 
-        visible_h = max_y - 3
-        slice_end = min(len(buffer), SCROLL_OFFSET + visible_h)
-        if SCROLL_OFFSET > max(0, len(buffer) - visible_h): SCROLL_OFFSET = max(0, len(buffer) - visible_h)
-        current_row = 3
-        for i in range(SCROLL_OFFSET, slice_end):
-            item = buffer[i]
-            text = item['text']
-            if len(text) > max_x - 1: text = text[:max_x-1]
-            attr = curses.A_NORMAL
-            if item['type'] == 'cat': attr = curses.A_BOLD | curses.A_UNDERLINE
-            elif item['type'] == 'row' and item['is_new']: attr = curses.A_BOLD
-            elif item['type'] == 'row': attr = curses.A_DIM
-            try: stdscr.addstr(current_row, 0, text, attr)
-            except: pass
-            current_row += 1
-            
-        if len(buffer) > visible_h:
-            scroll_pct = SCROLL_OFFSET / (len(buffer) - visible_h)
-            scroll_pos = 3 + int(scroll_pct * (visible_h - 1))
-            try: stdscr.addch(scroll_pos, max_x - 1, '█', curses.A_REVERSE)
-            except: pass
-        stdscr.refresh()
-        time.sleep(0.1)
+        while True:
+            max_y, max_x = stdscr.getmaxyx()
+            now = time.time()
+            with self.data_lock:
+                to_delete = []
+                for category in list(self.data.keys()):
+                    for key in list(self.data[category].keys()):
+                        if now - self.data[category][key]['last_seen'] > TIMEOUT:
+                            del self.data[category][key]
+                    if not self.data[category]:
+                        to_delete.append(category)
+                for cat in to_delete:
+                    del self.data[cat]
 
-def start_sniffing():
-    sniff(prn=parse_packet, store=0, filter="")
+            buffer = self._prepare_buffer()
 
-if __name__ == "__main__":
+            if not self._handle_input(stdscr, buffer, max_y, now):
+                break
+
+            stdscr.erase()
+            self._draw_header(stdscr, len(buffer), now, max_x)
+            self._draw_rows(stdscr, buffer, max_y, max_x)
+
+            time.sleep(0.1)
+
+    def run(self) -> None:
+        self.detect_local_ips()
+        t_sniff = threading.Thread(target=lambda: sniff(prn=self.parse_packet, store=0, filter=''))
+        t_sniff.daemon = True
+        t_sniff.start()
+
+        if not self.passive_mode:
+            t_res = threading.Thread(target=self.resolver_worker)
+            t_res.daemon = True
+            t_res.start()
+
+        try:
+            curses.wrapper(self.cleanup_and_display)
+        except KeyboardInterrupt:
+            print('Stopping...')
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-n', action='store_true', help="Passive mode (No DNS Lookups)")
-    parser.add_argument('-Q', action='store_true', help="Show mDNS Questions")
+    parser.add_argument('-n', action='store_true', help='Passive mode (No DNS Lookups)')
+    parser.add_argument('-Q', action='store_true', help='Show mDNS Questions')
     args = parser.parse_args()
-    PASSIVE_MODE = args.n
-    SHOW_QUESTIONS = args.Q
-    detect_local_ips()
-    t_sniff = threading.Thread(target=start_sniffing)
-    t_sniff.daemon = True
-    t_sniff.start()
-    if not PASSIVE_MODE:
-        t_res = threading.Thread(target=resolver_worker)
-        t_res.daemon = True
-        t_res.start()
-    try: curses.wrapper(cleanup_and_display)
-    except KeyboardInterrupt: print("Stopping...")
+
+    app = NetWatch(passive_mode=args.n, show_questions=args.Q)
+    app.run()
