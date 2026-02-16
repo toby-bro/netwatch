@@ -148,11 +148,13 @@ class NetWatch:
                 if proto not in ['tcp', 'udp']:
                     continue
 
-                # Extract local port
+                # Extract local and remote ports
                 local_addr = parts[4]
+                remote_addr = parts[5] if len(parts) > 5 else ''
+
                 if ':' in local_addr:
-                    port = local_addr.rsplit(':', 1)[1]
-                    if port == '*':
+                    local_port = local_addr.rsplit(':', 1)[1]
+                    if local_port == '*':
                         continue
 
                     # Extract process name
@@ -164,8 +166,19 @@ class NetWatch:
                         if match:
                             process = match.group(1)
 
-                    key = f'{proto}:{port}'
+                    # Map both local port and (for local connections) remote port
+                    key = f'{proto}:{local_port}'
                     port_map[key] = process
+
+                    # For localhost connections, also map the remote port
+                    if ':' in remote_addr:
+                        remote_port = remote_addr.rsplit(':', 1)[1]
+                        remote_ip = remote_addr.rsplit(':', 1)[0]
+                        # Check if remote is also localhost
+                        if remote_ip.startswith(('127.', '::1', '192.168.', '10.', 'fe80::')):
+                            remote_key = f'{proto}:{remote_port}'
+                            if remote_key not in port_map:
+                                port_map[remote_key] = process
 
             with self.process_lock:
                 self.port_to_process = port_map
@@ -343,7 +356,7 @@ class NetWatch:
 
     def _handle_active_connections(self, pkt: Any, src_ip: Optional[str], dst_ip: Optional[str]) -> None:
         if src_ip and dst_ip:
-            # Skip packets handled by specific protocol handlers
+            # Skip packets handled by specific protocol handlers (except DNS)
             if pkt.haslayer(UDP) and pkt.dport in [5353, 1900, 5355, 137, 27036]:
                 return
             if pkt.haslayer(UDP) and pkt.sport in [5353]:  # Also skip mDNS responses
@@ -358,6 +371,7 @@ class NetWatch:
             local_port = ''
             p_info = ''
             process = ''
+            is_dns = False
 
             if pkt.haslayer(TCP):
                 if src_ip in self.my_ips:
@@ -378,6 +392,10 @@ class NetWatch:
                 p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
                 process = self.get_process_for_port('udp', local_port)
 
+                # Check if this is DNS traffic (port 53)
+                if pkt[UDP].dport == 53 or pkt[UDP].sport == 53:
+                    is_dns = True
+
             if is_ignored:
                 key = f'{src_ip} > {dst_ip}'
                 self.update_entry('~ Ignored / Broadcast', key, f'{proto.upper()} {p_info}', process)
@@ -388,9 +406,70 @@ class NetWatch:
 
             if is_my_src or is_my_dst:
                 other_ip = dst_ip if is_my_src else src_ip
-                if not self.passive_mode and '.' in other_ip:
+
+                # For localhost-to-localhost, look up both source and destination processes
+                if is_my_src and is_my_dst:
+                    # Inter-process communication - get both processes
+                    src_process = ''
+                    dst_process = ''
+                    sport = 0
+                    dport = 0
+                    is_local_dns = False
+
+                    if pkt.haslayer(TCP):
+                        src_process = self.get_process_for_port('tcp', str(pkt[TCP].sport))
+                        dst_process = self.get_process_for_port('tcp', str(pkt[TCP].dport))
+                        sport = pkt[TCP].sport
+                        dport = pkt[TCP].dport
+                        if sport == 53 or dport == 53:
+                            is_local_dns = True
+                    elif pkt.haslayer(UDP):
+                        src_process = self.get_process_for_port('udp', str(pkt[UDP].sport))
+                        dst_process = self.get_process_for_port('udp', str(pkt[UDP].dport))
+                        sport = pkt[UDP].sport
+                        dport = pkt[UDP].dport
+                        if sport == 53 or dport == 53:
+                            is_local_dns = True
+
+                    # Create descriptive key and process info
+                    key = f':{sport} > :{dport}'
+                    src_name = src_process if src_process else 'unknown'
+                    dst_name = dst_process if dst_process else 'unknown'
+                    process_flow = f'{src_name} → {dst_name}'
+
+                    # Categorize based on whether it's DNS or other IPC
+                    if is_local_dns:
+                        category = 'DNS Queries (Local)'
+                        info = 'Local DNS'
+                    else:
+                        category = 'Local Inter-Process'
+                        info = f'{proto.upper()} IPC'
+
+                    # Show inter-process local traffic with both processes
+                    self.update_entry(category, key, info, process_flow)
+                    return
+
+                if not self.passive_mode and '.' in other_ip and not is_dns:
+                    # Don't queue DNS servers for resolution (infinite loop)
                     self.resolver_queue.put(other_ip)
-                self.update_entry('Active_Connections', f'{other_ip}{port}', f'{proto.upper()} Traffic', process)
+
+                # Determine category
+                category = 'Active_Connections'
+
+                # DNS queries get their own category
+                if is_dns:
+                    category = 'DNS Queries'
+                    info = 'DNS Lookup'
+                else:
+                    # Check if it's a local network device
+                    with self.resolved_lock:
+                        resolved_name = self.resolved_names.get(other_ip)
+
+                    if self.is_local_network_device(other_ip, resolved_name):
+                        category = 'Local Network Devices'
+                    info = f'{proto.upper()} Traffic'
+
+                self.update_entry(category, f'{other_ip}{port}', info, process)
             else:
                 key = f'{src_ip} > {dst_ip}'
                 self.update_entry('~ Unclassified / Other Traffic', key, f'{proto.upper()} {p_info}', process)
@@ -406,11 +485,58 @@ class NetWatch:
             src_ip = pkt[IPv6].src
             dst_ip = pkt[IPv6].dst
 
-        if src_ip:
-            if src_ip not in self.my_ips and '.' in src_ip:
-                if src_ip.startswith(('192.168.', '10.')):
-                    self.my_ips.add(src_ip)
+        # Add local network IPs to my_ips set
+        if src_ip and src_ip not in self.my_ips and '.' in src_ip:
+            if src_ip.startswith(
+                (
+                    '192.168.',
+                    '10.',
+                    '172.16.',
+                    '172.17.',
+                    '172.18.',
+                    '172.19.',
+                    '172.20.',
+                    '172.21.',
+                    '172.22.',
+                    '172.23.',
+                    '172.24.',
+                    '172.25.',
+                    '172.26.',
+                    '172.27.',
+                    '172.28.',
+                    '172.29.',
+                    '172.30.',
+                    '172.31.',
+                ),
+            ):
+                self.my_ips.add(src_ip)
 
+        if dst_ip and dst_ip not in self.my_ips and '.' in dst_ip:
+            if dst_ip.startswith(
+                (
+                    '192.168.',
+                    '10.',
+                    '172.16.',
+                    '172.17.',
+                    '172.18.',
+                    '172.19.',
+                    '172.20.',
+                    '172.21.',
+                    '172.22.',
+                    '172.23.',
+                    '172.24.',
+                    '172.25.',
+                    '172.26.',
+                    '172.27.',
+                    '172.28.',
+                    '172.29.',
+                    '172.30.',
+                    '172.31.',
+                ),
+            ):
+                self.my_ips.add(dst_ip)
+
+        if src_ip:
             if src_ip in self.my_ips:
                 self.ip_activity[src_ip] += 1
             if dst_ip and dst_ip in self.my_ips:
@@ -425,6 +551,21 @@ class NetWatch:
         self._handle_infra(pkt)
         self._handle_ping(pkt)
         self._handle_active_connections(pkt, src_ip, dst_ip)
+
+    def is_local_network_device(self, ip: str, resolved_name: Optional[str]) -> bool:
+        """Check if IP/name represents a local network mDNS device."""
+        # Check if IP is local network
+        if not ip.startswith(('192.168.', '10.', '172.')):
+            return False
+
+        # Check if name has mDNS-like patterns
+        if resolved_name:
+            mdns_patterns = ['_on_', ' on ', '_mqtt_', '.local', 'mss_', '_printer_', '_iot_']
+            name_lower = resolved_name.lower()
+            if any(pattern in name_lower for pattern in mdns_patterns):
+                return True
+
+        return False
 
     def get_display_name(self, key: str) -> str:
         if '>' in key:
@@ -601,6 +742,7 @@ class NetWatch:
             now = time.time()
             with self.data_lock:
                 to_delete = []
+                # Clean up old entries only
                 for category in list(self.data.keys()):
                     for key in list(self.data[category].keys()):
                         if now - self.data[category][key]['last_seen'] > TIMEOUT:
