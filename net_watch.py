@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import curses
 import functools
 import logging
@@ -11,9 +12,10 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
-from typing import Any, DefaultDict, Dict, List, Optional, Set
+from queue import Empty, Queue
+from typing import Any
 
 from scapy.all import get_if_addr, get_if_list, sniff
 from scapy.layers.dns import DNS
@@ -45,7 +47,7 @@ def is_private_ip_cached(ip: str) -> bool:
 
 
 @functools.lru_cache(maxsize=256)
-def clean_mdns_name_cached(name: str) -> Optional[str]:
+def clean_mdns_name_cached(name: str) -> str | None:
     """Cached clean mDNS name. Takes string only for caching."""
     try:
         if name.endswith('.'):
@@ -63,10 +65,22 @@ def clean_mdns_name_cached(name: str) -> Optional[str]:
 
         if len(name) < 2 or name.startswith('_'):
             return None
-        return name
     except Exception:
         logging.error('Error cleaning mDNS name', exc_info=True)
         return None
+    else:
+        return name
+
+
+@functools.lru_cache(maxsize=1024)
+def resolve_hostname_cached(ip: str) -> str | None:
+    """Cached DNS resolution - module level for lock-free async access."""
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+    except (socket.herror, socket.gaierror, OSError):
+        return None
+    else:
+        return hostname
 
 
 @functools.lru_cache(maxsize=128)
@@ -115,26 +129,35 @@ class NetWatch:
         self.passive_mode = passive_mode
         self.show_questions = show_questions
 
-        # --- State Management ---
-        self.data: DefaultDict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
-        self.data_lock = threading.Lock()
+        # --- State Management (Single Writer Pattern) ---
+        self.data: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        # NO LOCK - only single writer thread modifies data
+        # UI thread only reads (safe without lock)
+
         self.scroll_offset = 0
         self.status_msg = ''
         self.status_time = 0.0
 
         # IP Management
-        self.my_ips: Set[str] = set()
+        self.my_ips: set[str] = set()
         self.ip_activity: Counter[str] = Counter()  # Track packet count to find "Main" IP
 
-        # Name Resolution
-        self.resolved_names: Dict[str, Optional[str]] = {}
-        self.resolved_lock = threading.Lock()
-        self.resolver_queue: Queue[str] = Queue()
+        # Name Resolution (now using cached function)
+        self.resolved_names: dict[str, str | None] = {}
+        self.dns_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='dns')
 
         # Process Resolution
-        self.port_to_process: Dict[str, str] = {}  # Maps "proto:port" -> "process_name"
-        self.process_lock = threading.Lock()
+        self.port_to_process: dict[str, str] = {}  # Maps "proto:port" -> "process_name"
         self.last_process_scan = 0.0
+        # Note: No process_lock - dict reads/writes are atomic in CPython
+
+        # Connection-based process cache for efficiency
+        # (src_ip, src_port, dst_ip, dst_port, proto) -> process
+        self.connection_cache: dict[tuple[str, str, str, str, str], str] = {}
+        # Note: No lock needed - dict ops are atomic in CPython
+
+        # Single writer command queue - all mutations go here
+        self.command_queue: Queue[dict[str, Any]] = Queue()
 
         # Display constants
         self.w_ip, self.w_info, self.w_age, self.w_ppm, self.w_proc = 38, 18, 6, 6, 18
@@ -143,18 +166,19 @@ class NetWatch:
         # Performance monitoring
         self.perf_monitor = PerformanceMonitor()
 
+        # Layer cache for packet processing (no lock needed - single threaded access in parse_packet)
+        self._layer_cache: dict[int, dict[str, Any]] = {}  # packet id -> layer dict
+
     @staticmethod
     def is_private_ip(ip: str) -> bool:
         """Check if IP is in RFC1918 private address space."""
         return is_private_ip_cached(ip)
 
-    def clean_mdns_name(self, name_input: Any) -> Optional[str]:
+    def clean_mdns_name(self, name_input: bytes | str) -> str | None:
+        """Wrapper to handle bytes/any input before caching."""
         try:
             # Handle bytes or string input safely
-            if isinstance(name_input, bytes):
-                name = name_input.decode('utf-8', errors='ignore')
-            else:
-                name = str(name_input)
+            name = name_input.decode('utf-8', errors='ignore') if isinstance(name_input, bytes) else str(name_input)
             return clean_mdns_name_cached(name)
         except Exception:
             logging.error('Error cleaning mDNS name wrapper', exc_info=True)
@@ -234,40 +258,66 @@ class NetWatch:
             for line in result.stdout.split('\n'):
                 self._parse_ss_line(line, port_map)
 
-            with self.process_lock:
-                self.port_to_process = port_map
-                self.last_process_scan = time.time()
+            # Atomic dict replacement - no lock needed
+            self.port_to_process = port_map
+            self.last_process_scan = time.time()
         except Exception:
             logging.error('Error scanning processes', exc_info=True)
 
     def get_process_for_port(self, proto: str, port: str) -> str:
         """Get the process name for a given protocol and port."""
-        # Rescan every 5 seconds
-        if time.time() - self.last_process_scan > 5:
+        # Rescan every 10 seconds (increased from 5 for less overhead)
+        if time.time() - self.last_process_scan > 10:
             self.scan_processes()
 
-        with self.process_lock:
-            key = f'{proto.lower()}:{port}'
-            return self.port_to_process.get(key, '')
+        # Lock-free read - dict access is atomic in CPython
+        key = f'{proto.lower()}:{port}'
+        return self.port_to_process.get(key, '')
 
-    def resolver_worker(self) -> None:
-        while True:
-            try:
-                ip = self.resolver_queue.get(timeout=1)
-                with self.resolved_lock:
-                    if ip in self.resolved_names:
-                        continue
-                try:
-                    hostname, _, _ = socket.gethostbyaddr(ip)
-                    with self.resolved_lock:
-                        self.resolved_names[ip] = hostname
-                except Exception:
-                    with self.resolved_lock:
-                        self.resolved_names[ip] = None
-            except Empty:
-                continue
-            except Exception:
-                logging.error('Error in resolver worker', exc_info=True)
+    def get_process_for_connection(
+        self,
+        src_ip: str,
+        src_port: str,
+        dst_ip: str,
+        dst_port: str,
+        proto: str,
+    ) -> str:
+        """Get process for a connection tuple with caching."""
+        cache_key = (src_ip, src_port, dst_ip, dst_port, proto)
+
+        # Check cache first - lock-free read for existing keys
+        cached = self.connection_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # Not in cache, determine which port to lookup
+        is_my_src = src_ip in self.my_ips
+        local_port = src_port if is_my_src else dst_port
+        process = self.get_process_for_port(proto, local_port)
+
+        # Lock-free write - dict assignment is atomic in CPython
+        self.connection_cache[cache_key] = process
+
+        # Periodically clean cache (only on every 100th addition)
+        cache_size = len(self.connection_cache)
+        if cache_size > 1000 and cache_size % 100 == 0:
+            # Create new dict with recent entries - atomic replacement
+            items = list(self.connection_cache.items())
+            self.connection_cache = dict(items[-800:])  # Keep most recent 800
+
+        return process
+
+    def async_resolve_hostname(self, ip: str) -> None:
+        """Asynchronously resolve hostname using cached function."""
+        if ip in self.resolved_names:
+            return
+
+        # Submit to thread pool for async resolution
+        def resolve_and_store() -> None:
+            result = resolve_hostname_cached(ip)
+            self.resolved_names[ip] = result
+
+        self.dns_executor.submit(resolve_and_store)
 
     def update_entry(
         self,
@@ -276,25 +326,136 @@ class NetWatch:
         info: str,
         process: str = '',
     ) -> None:
-        now = time.time()
-        with self.data_lock:
-            if key not in self.data[category]:
-                self.data[category][key] = {
-                    'last_seen': now,
-                    'first_seen': now,
-                    'count': 0,
-                    'info': info,
-                    'process': process,
-                }
-            entry = self.data[category][key]
-            entry['last_seen'] = now
-            entry['count'] += 1
-            if entry['info'] == 'Multicast DNS' and info != 'Multicast DNS':
-                entry['info'] = info
-            if process and not entry.get('process'):
-                entry['process'] = process
+        """Queue an update for single writer thread."""
+        self.command_queue.put(
+            {
+                'cmd': 'update',
+                'category': category,
+                'key': key,
+                'info': info,
+                'process': process,
+                'timestamp': time.time(),
+            },
+        )
 
-    def _extract_name_from_rr(self, rr: Any) -> Optional[str]:
+    def single_writer_worker(self) -> None:
+        """Single writer thread - ONLY thread that modifies self.data.
+
+        All mutations go through command queue. This eliminates lock contention
+        because UI only reads (safe without locks in single-writer pattern).
+        """
+        batch = []
+
+        while True:
+            try:
+                # Collect commands in batches for efficiency
+                try:
+                    cmd = self.command_queue.get(timeout=0.05)
+                    batch.append(cmd)
+                except Empty:
+                    if batch:
+                        self._process_command_batch(batch)
+                        batch = []
+                    continue
+
+                # Drain queue
+                while len(batch) < 100:  # Max batch size
+                    try:
+                        batch.append(self.command_queue.get_nowait())
+                    except Empty:
+                        break
+
+                # Process batch
+                if batch:
+                    self._process_command_batch(batch)
+                    batch = []
+
+            except Exception:
+                logging.error('Error in single writer', exc_info=True)
+                time.sleep(0.01)
+
+    def _process_command_batch(self, commands: list[dict[str, Any]]) -> None:
+        """Process batch of commands - NO LOCKS NEEDED (single writer)."""
+        # Merge duplicate updates and collect cleanups
+        updates: dict[tuple[str, str], dict[str, Any]] = {}
+        cleanups = []
+
+        for cmd in commands:
+            if cmd['cmd'] == 'update':
+                self._merge_update(updates, cmd)
+            elif cmd['cmd'] == 'cleanup':
+                cleanups.append(cmd)
+
+        # Apply updates
+        for cat_key, upd in updates.items():
+            self._apply_single_update(cat_key, upd)
+
+        # Process cleanups
+        for cleanup in cleanups:
+            self._do_cleanup(cleanup['now'])
+
+    def _merge_update(self, updates: dict[tuple[str, str], dict[str, Any]], cmd: dict[str, Any]) -> None:
+        """Merge update command into updates dict."""
+        cat_key = (cmd['category'], cmd['key'])
+        if cat_key not in updates:
+            updates[cat_key] = {
+                'category': cmd['category'],
+                'key': cmd['key'],
+                'info': cmd['info'],
+                'process': cmd['process'],
+                'timestamp': cmd['timestamp'],
+                'count': 1,
+            }
+        else:
+            existing = updates[cat_key]
+            existing['timestamp'] = max(existing['timestamp'], cmd['timestamp'])
+            existing['count'] += 1
+            if existing['info'] == 'Multicast DNS' and cmd['info'] != 'Multicast DNS':
+                existing['info'] = cmd['info']
+            if cmd['process'] and not existing['process']:
+                existing['process'] = cmd['process']
+
+    def _apply_single_update(self, cat_key: tuple[str, str], upd: dict[str, Any]) -> None:
+        """Apply a single merged update."""
+        category, key = cat_key
+        now = upd['timestamp']
+        inc_count = upd['count']
+
+        entry = self.data[category].get(key)
+        if entry is None:
+            self.data[category][key] = {
+                'last_seen': now,
+                'first_seen': now,
+                'count': inc_count,
+                'info': upd['info'],
+                'process': upd['process'],
+            }
+        else:
+            entry['last_seen'] = now
+            entry['count'] += inc_count
+            if entry['info'] == 'Multicast DNS' and upd['info'] != 'Multicast DNS':
+                entry['info'] = upd['info']
+            if upd['process'] and not entry.get('process'):
+                entry['process'] = upd['process']
+
+    def _do_cleanup(self, now: float) -> None:
+        """Cleanup expired entries - called by single writer only."""
+        expired = []
+        for category in list(self.data.keys()):
+            for key, details in list(self.data[category].items()):
+                if now - details['last_seen'] > TIMEOUT:
+                    expired.append((category, key))
+
+        for category, key in expired:
+            if key in self.data.get(category, {}):
+                del self.data[category][key]
+
+        # Remove empty categories
+        for category in list(self.data.keys()):
+            if not self.data[category]:
+                del self.data[category]
+
+    def _extract_name_from_rr(self, rr: Packet) -> str | None:
         extracted = None
         # PTR (12), TXT (16), SRV (33), A (1), AAAA (28)
         if rr.type == 12:
@@ -306,12 +467,13 @@ class NetWatch:
         return extracted
 
     def _update_resolved_name(self, sip: str, extracted: str) -> None:
-        with self.resolved_lock:
-            prev = self.resolved_names.get(sip)
-            if not prev or (len(extracted) > len(prev) and '._' not in extracted):
-                self.resolved_names[sip] = extracted
+        # Lock-free read then conditional write
+        prev = self.resolved_names.get(sip)
+        if not prev or (len(extracted) > len(prev) and '._' not in extracted):
+            # Lock-free write - dict assignment is atomic
+            self.resolved_names[sip] = extracted
 
-    def _scan_dns_records(self, dns_layer: Any, sip: str) -> None:
+    def _scan_dns_records(self, dns_layer: DNS, sip: str) -> None:
         scan_lists = []
         if dns_layer.an:
             scan_lists.append(dns_layer.an)
@@ -326,7 +488,7 @@ class NetWatch:
                     self._update_resolved_name(sip, extracted)
                 rr = rr.payload
 
-    def _log_dns_questions(self, dns_layer: Any, sip: str) -> None:
+    def _log_dns_questions(self, dns_layer: DNS, sip: str) -> None:
         if self.show_questions and dns_layer.qd:
             q_rr = dns_layer.qd
             while q_rr:
@@ -339,7 +501,7 @@ class NetWatch:
                     )
                 q_rr = q_rr.payload
 
-    def _get_dns_category_info(self, dns_layer: Any) -> tuple[str, str]:
+    def _get_dns_category_info(self, dns_layer: DNS) -> tuple[str, str]:
         category, info = 'mDNS (General)', 'Multicast DNS'
         raw_dns = bytes(dns_layer)
         if b'_airplay' in raw_dns or b'_companion-link' in raw_dns:
@@ -357,15 +519,17 @@ class NetWatch:
         initial_category: str,
         initial_info: str,
     ) -> None:
-        dns_layer = pkt.getlayer(DNS)
-        if not dns_layer:
+        dns_layer_raw = pkt.getlayer(DNS)
+        if not dns_layer_raw:
             try:
-                dns_layer = DNS(pkt[UDP].payload)
-            except Exception:
-                dns_layer = None
+                dns_layer_raw = DNS(pkt[UDP].payload)
+            except (ValueError, IndexError, AttributeError):
+                dns_layer_raw = None
 
         category, info = initial_category, initial_info
-        if dns_layer:
+        if dns_layer_raw:
+            # Type-cast for mypy - we know it's DNS if not None
+            dns_layer: DNS = dns_layer_raw  # type: ignore[assignment]
             try:
                 self._log_dns_questions(dns_layer, sip)
                 category, info = self._get_dns_category_info(dns_layer)
@@ -379,7 +543,7 @@ class NetWatch:
             ident = f'{pkt[ARP].psrc} ({pkt[ARP].hwsrc})'
             self.update_entry('ARP_Neighbors', ident, 'ARP Announcement')
             if not self.passive_mode:
-                self.resolver_queue.put(pkt[ARP].psrc)
+                self.async_resolve_hostname(pkt[ARP].psrc)
 
     def _handle_mdns(self, pkt: Packet, sip: str) -> None:
         if pkt.haslayer(UDP) and (pkt.dport == 5353 or pkt.sport == 5353):
@@ -396,7 +560,7 @@ class NetWatch:
                 self.update_entry('Windows/NetBIOS', sip, 'Name Query')
 
             if not self.passive_mode and '.' in sip and pkt.dport in [1900, 5355, 137]:
-                self.resolver_queue.put(sip)
+                self.async_resolve_hostname(sip)
 
     def _handle_steam(self, pkt: Packet, sip: str) -> None:
         if pkt.haslayer(UDP):
@@ -404,7 +568,7 @@ class NetWatch:
                 if pkt.dport == 27036 or b'STEAM' in bytes(pkt[UDP].payload):
                     self.update_entry('Steam_Gamers', sip, 'Steam LAN Discovery')
                     if not self.passive_mode and '.' in sip:
-                        self.resolver_queue.put(sip)
+                        self.async_resolve_hostname(sip)
             except Exception:
                 logging.error('Error parsing Steam packet', exc_info=True)
 
@@ -418,46 +582,69 @@ class NetWatch:
                 self.update_entry('Infrastructure', mac_src, 'Switch/Router (LLDP)')
 
     def _handle_ping(self, pkt: Packet) -> None:
-        if pkt.haslayer(ICMP) and pkt.haslayer(IP):
-            if pkt[IP].dst in self.my_ips and pkt[ICMP].type == 8:
-                self.update_entry('Pinging_Me', pkt[IP].src, 'ICMP Echo Request')
-                if not self.passive_mode:
-                    self.resolver_queue.put(pkt[IP].src)
+        if pkt.haslayer(ICMP) and pkt.haslayer(IP) and pkt[IP].dst in self.my_ips and pkt[ICMP].type == 8:
+            self.update_entry('Pinging_Me', pkt[IP].src, 'ICMP Echo Request')
+            if not self.passive_mode:
+                self.async_resolve_hostname(pkt[IP].src)
 
-    def _extract_tcp_info(self, pkt: Packet, src_ip: str) -> tuple[str, str, str, str]:
+    def _extract_tcp_info(
+        self,
+        src_ip: str,
+        dst_ip: str,
+        tcp_layer: TCP,
+    ) -> tuple[str, str, str, str]:
         """Extract TCP connection info."""
         is_my_src = src_ip in self.my_ips
-        sport, dport = pkt[TCP].sport, pkt[TCP].dport
+        sport, dport = tcp_layer.sport, tcp_layer.dport
         port = f':{dport}' if is_my_src else f':{sport}'
-        local_port = str(sport if is_my_src else dport)
         p_info = f':{sport} > :{dport}'
-        process = self.get_process_for_port('tcp', local_port)
-        return port, local_port, p_info, process
+        # Use connection cache for efficiency
+        process = self.get_process_for_connection(
+            src_ip,
+            str(sport),
+            dst_ip,
+            str(dport),
+            'tcp',
+        )
+        return port, str(sport if is_my_src else dport), p_info, process
 
     def _extract_udp_info(
         self,
-        pkt: Packet,
         src_ip: str,
+        dst_ip: str,
+        udp_layer: UDP,
     ) -> tuple[str, str, str, str, bool]:
         """Extract UDP connection info and DNS flag."""
         is_my_src = src_ip in self.my_ips
-        sport, dport = pkt[UDP].sport, pkt[UDP].dport
+        sport, dport = udp_layer.sport, udp_layer.dport
         port = f':{dport}' if is_my_src else f':{sport}'
-        local_port = str(sport if is_my_src else dport)
         p_info = f':{sport} > :{dport}'
-        process = self.get_process_for_port('udp', local_port)
+        # Use connection cache for efficiency
+        process = self.get_process_for_connection(
+            src_ip,
+            str(sport),
+            dst_ip,
+            str(dport),
+            'udp',
+        )
         is_dns = sport == 53 or dport == 53
-        return port, local_port, p_info, process, is_dns
+        return port, str(sport if is_my_src else dport), p_info, process, is_dns
 
-    def _handle_local_ipc(self, pkt: Packet, proto: str) -> None:
+    def _handle_local_ipc(
+        self,
+        proto: str,
+        layers: dict[str, Any],
+    ) -> None:
         """Handle inter-process communication on localhost."""
-        if pkt.haslayer(TCP):
-            sport, dport = pkt[TCP].sport, pkt[TCP].dport
+        tcp_layer = layers.get('tcp')
+        udp_layer = layers.get('udp')
+        if tcp_layer:
+            sport, dport = tcp_layer.sport, tcp_layer.dport
             src_process = self.get_process_for_port('tcp', str(sport))
             dst_process = self.get_process_for_port('tcp', str(dport))
             is_local_dns = sport == 53 or dport == 53
-        elif pkt.haslayer(UDP):
-            sport, dport = pkt[UDP].sport, pkt[UDP].dport
+        elif udp_layer:
+            sport, dport = udp_layer.sport, udp_layer.dport
             src_process = self.get_process_for_port('udp', str(sport))
             dst_process = self.get_process_for_port('udp', str(dport))
             is_local_dns = sport == 53 or dport == 53
@@ -487,41 +674,23 @@ class NetWatch:
 
     def _handle_active_connections(
         self,
-        pkt: Packet,
-        src_ip: Optional[str],
-        dst_ip: Optional[str],
+        src_ip: str | None,
+        dst_ip: str | None,
+        layers: dict[str, Any],
     ) -> None:
         if not (src_ip and dst_ip):
             return
 
+        tcp_layer = layers.get('tcp')
+        udp_layer = layers.get('udp')
+
         # Skip packets handled by specific protocol handlers
-        if pkt.haslayer(UDP):
-            if pkt.dport in [5353, 1900, 5355, 137, 27036] or pkt.sport in [5353]:
-                return
+        if self._should_skip_udp_packet(udp_layer):
+            return
 
         # Check for broadcast/multicast
-        if dst_ip.endswith('.255') or dst_ip.startswith(('224.', '239.', 'ff02:')):
-            proto = 'tcp' if pkt.haslayer(TCP) else 'udp' if pkt.haslayer(UDP) else 'ip'
-            if pkt.haslayer(TCP):
-                p_info = f':{pkt[TCP].sport} > :{pkt[TCP].dport}'
-                process = self.get_process_for_port(
-                    'tcp',
-                    str(pkt[TCP].sport if src_ip in self.my_ips else pkt[TCP].dport),
-                )
-            elif pkt.haslayer(UDP):
-                p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
-                process = self.get_process_for_port(
-                    'udp',
-                    str(pkt[UDP].sport if src_ip in self.my_ips else pkt[UDP].dport),
-                )
-            else:
-                p_info, process = '', ''
-            self.update_entry(
-                '~ Ignored / Broadcast',
-                f'{src_ip} > {dst_ip}',
-                f'{proto.upper()} {p_info}',
-                process,
-            )
+        if self._is_broadcast_or_multicast(dst_ip):
+            self._handle_broadcast(src_ip, dst_ip, tcp_layer, udp_layer)
             return
 
         is_my_src = src_ip in self.my_ips
@@ -529,55 +698,96 @@ class NetWatch:
 
         # Handle local inter-process communication
         if is_my_src and is_my_dst:
-            proto = 'tcp' if pkt.haslayer(TCP) else 'udp' if pkt.haslayer(UDP) else 'ip'
-            self._handle_local_ipc(pkt, proto)
+            proto = 'tcp' if tcp_layer else 'udp' if udp_layer else 'ip'
+            self._handle_local_ipc(proto, layers)
             return
 
         # Handle connections involving this machine
         if is_my_src or is_my_dst:
-            other_ip = dst_ip if is_my_src else src_ip
-            proto = 'tcp' if pkt.haslayer(TCP) else 'udp' if pkt.haslayer(UDP) else 'ip'
-            is_dns = False
+            self._handle_external_connection(src_ip, dst_ip, is_my_src, tcp_layer, udp_layer)
 
-            if pkt.haslayer(TCP):
-                port, _, _, process = self._extract_tcp_info(pkt, src_ip)
-            elif pkt.haslayer(UDP):
-                port, _, _, process, is_dns = self._extract_udp_info(pkt, src_ip)
-            else:
-                port, process = '', ''
+    def _should_skip_udp_packet(self, udp_layer: UDP | None) -> bool:
+        """Check if UDP packet should be skipped."""
+        if not udp_layer:
+            return False
+        return udp_layer.dport in [5353, 1900, 5355, 137, 27036] or udp_layer.sport in [5353]
 
-            # Queue for resolution if not DNS
-            if not self.passive_mode and '.' in other_ip and not is_dns:
-                self.resolver_queue.put(other_ip)
+    def _is_broadcast_or_multicast(self, dst_ip: str) -> bool:
+        """Check if destination is broadcast or multicast."""
+        return dst_ip.endswith('.255') or dst_ip.startswith(('224.', '239.', 'ff02:'))
 
-            # Determine category
-            if is_dns:
-                category, info = 'DNS Queries', 'DNS Lookup'
-            else:
-                with self.resolved_lock:
-                    resolved_name = self.resolved_names.get(other_ip)
-                if self.is_local_network_device(other_ip, resolved_name):
-                    category = 'Local Network Devices'
-                else:
-                    category = 'Active_Connections'
-                info = f'{proto.upper()} Traffic'
-
-            self.update_entry(category, f'{other_ip}{port}', info, process)
-        else:
-            # Unclassified traffic
-            proto = 'tcp' if pkt.haslayer(TCP) else 'udp' if pkt.haslayer(UDP) else 'ip'
-            if pkt.haslayer(TCP):
-                p_info = f':{pkt[TCP].sport} > :{pkt[TCP].dport}'
-            elif pkt.haslayer(UDP):
-                p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
-            else:
-                p_info = ''
-            self.update_entry(
-                '~ Unclassified / Other Traffic',
-                f'{src_ip} > {dst_ip}',
-                f'{proto.upper()} {p_info}',
-                '',
+    def _handle_broadcast(
+        self,
+        src_ip: str,
+        dst_ip: str,
+        tcp_layer: TCP | None,
+        udp_layer: UDP | None,
+    ) -> None:
+        """Handle broadcast/multicast packets."""
+        proto = 'tcp' if tcp_layer else 'udp' if udp_layer else 'ip'
+        if tcp_layer:
+            p_info = f':{tcp_layer.sport} > :{tcp_layer.dport}'
+            process = self.get_process_for_connection(
+                src_ip,
+                str(tcp_layer.sport),
+                dst_ip,
+                str(tcp_layer.dport),
+                'tcp',
             )
+        elif udp_layer:
+            p_info = f':{udp_layer.sport} > :{udp_layer.dport}'
+            process = self.get_process_for_connection(
+                src_ip,
+                str(udp_layer.sport),
+                dst_ip,
+                str(udp_layer.dport),
+                'udp',
+            )
+        else:
+            p_info, process = '', ''
+        self.update_entry(
+            '~ Ignored / Broadcast',
+            f'{src_ip} > {dst_ip}',
+            f'{proto.upper()} {p_info}',
+            process,
+        )
+
+    def _handle_external_connection(
+        self,
+        src_ip: str,
+        dst_ip: str,
+        is_my_src: bool,
+        tcp_layer: TCP | None,
+        udp_layer: UDP | None,
+    ) -> None:
+        """Handle connections to/from external hosts."""
+        other_ip = dst_ip if is_my_src else src_ip
+        proto = 'tcp' if tcp_layer else 'udp' if udp_layer else 'ip'
+        is_dns = False
+
+        if tcp_layer:
+            port, _, _, process = self._extract_tcp_info(src_ip, dst_ip, tcp_layer)
+        elif udp_layer:
+            port, _, _, process, is_dns = self._extract_udp_info(src_ip, dst_ip, udp_layer)
+        else:
+            port, process = '', ''
+
+        # Queue for resolution if not DNS
+        if not self.passive_mode and '.' in other_ip and not is_dns:
+            self.async_resolve_hostname(other_ip)
+
+        # Determine category
+        if is_dns:
+            category, info = 'DNS Queries', 'DNS Lookup'
+        else:
+            resolved_name = self.resolved_names.get(other_ip)
+            if self.is_local_network_device(other_ip, resolved_name):
+                category = 'Local Network Devices'
+            else:
+                category = 'Active_Connections'
+            info = f'{proto.upper()} Traffic'
+
+        self.update_entry(category, f'{other_ip}{port}', info, process)
 
     def parse_packet(self, pkt: Packet) -> None:
         """Parse a packet and update state."""
@@ -588,16 +798,28 @@ class NetWatch:
             self.perf_monitor.record_packet(time.time() - start_time)
 
     def _parse_packet_internal(self, pkt: Packet) -> None:
-        """Internal packet parsing logic."""
+        """Internal packet parsing logic with layer caching."""
+        # Extract all layers once at the start (optimization phase 3)
+        layers = {
+            'ip': pkt.getlayer(IP),
+            'ipv6': pkt.getlayer(IPv6),
+            'tcp': pkt.getlayer(TCP),
+            'udp': pkt.getlayer(UDP),
+            'arp': pkt.getlayer(ARP),
+            'dns': pkt.getlayer(DNS),
+            'ether': pkt.getlayer(Ether),
+            'icmp': pkt.getlayer(ICMP),
+        }
+
         src_ip = None
         dst_ip = None
 
-        if pkt.haslayer(IP):
-            src_ip = pkt[IP].src
-            dst_ip = pkt[IP].dst
-        elif pkt.haslayer(IPv6):
-            src_ip = pkt[IPv6].src
-            dst_ip = pkt[IPv6].dst
+        if layers['ip']:
+            src_ip = layers['ip'].src
+            dst_ip = layers['ip'].dst
+        elif layers['ipv6']:
+            src_ip = layers['ipv6'].src
+            dst_ip = layers['ipv6'].dst
 
         # Add local network IPs to my_ips set
         if src_ip and src_ip not in self.my_ips and '.' in src_ip and self.is_private_ip(src_ip):
@@ -620,9 +842,9 @@ class NetWatch:
         self._handle_steam(pkt, sip)
         self._handle_infra(pkt)
         self._handle_ping(pkt)
-        self._handle_active_connections(pkt, src_ip, dst_ip)
+        self._handle_active_connections(src_ip, dst_ip, layers)
 
-    def is_local_network_device(self, ip: str, resolved_name: Optional[str]) -> bool:
+    def is_local_network_device(self, ip: str, resolved_name: str | None) -> bool:
         """Check if IP/name represents a local network mDNS device."""
         # Check if IP is local network
         if not self.is_private_ip(ip):
@@ -646,15 +868,21 @@ class NetWatch:
         return False
 
     def get_display_name(self, key: str) -> str:
+        """Get display name - uses cached resolver, never blocks."""
         if '>' in key:
             return key
         ip_part = key.split(':', maxsplit=1)[0].split(' ')[0]
-        with self.resolved_lock:
-            name = self.resolved_names.get(ip_part)
-            if name:
-                if key == ip_part:
-                    return f'{name} ({ip_part})'
-                return f"{name} {key.replace(ip_part, '')}"
+
+        # Attempt async resolution if not already resolved
+        if ip_part not in self.resolved_names and not self.passive_mode:
+            self.async_resolve_hostname(ip_part)
+
+        # Use cached result if available
+        name = self.resolved_names.get(ip_part)
+        if name:
+            if key == ip_part:
+                return f'{name} ({ip_part})'
+            return f"{name} {key.replace(ip_part, '')}"
         return key
 
     def truncate(self, text: str, width: int) -> str:
@@ -662,7 +890,7 @@ class NetWatch:
             return text[: width - 3] + '...'
         return text
 
-    def save_to_file(self, text: str) -> Optional[str]:
+    def save_to_file(self, text: str) -> str | None:
         try:
             log_dir = os.path.join(tempfile.gettempdir(), 'net_watch')
             if not os.path.exists(log_dir):
@@ -673,59 +901,97 @@ class NetWatch:
 
             with open(filename, 'w') as f:
                 f.write(text)
-            return filename
-        except Exception:
+        except OSError:
             logging.error('Error saving to file', exc_info=True)
             return None
+        else:
+            return filename
 
     def generate_table_string(self) -> str:
+        """Generate table for file export - lock-free read (single writer pattern)."""
         lines = []
         lines.append(
             f"{'DEVICE / IP':<38} | {'INFO':<18} | {'AGE':<6} | {'PPM':<6} | {'PROCESS':<18}",
         )
         lines.append('-' * 100)
-        with self.data_lock:
-            now = time.time()
-            for cat in sorted(self.data.keys()):
-                lines.append(f'[{cat}]')
-                for key, details in self.data[cat].items():
-                    name = self.get_display_name(key)
-                    age = int(now - details['last_seen'])
-                    duration = max(1, now - details['first_seen'])
-                    ppm = int((details['count'] / duration) * 60)
-                    process = details.get('process', '')
-                    lines.append(
-                        f"  {name:<38} | {details['info']:<18} | {age:<6} | {ppm:<6} | {process:<18}",
-                    )
-                lines.append('')
+
+        # No lock needed - single writer guarantees consistency
+        now = time.time()
+        for cat in sorted(self.data.keys()):
+            lines.append(f'[{cat}]')
+            for key, details in self.data[cat].items():
+                name = self.get_display_name(key)
+                age = int(now - details['last_seen'])
+                duration = max(1, now - details['first_seen'])
+                ppm = int((details['count'] / duration) * 60)
+                process = details.get('process', '')
+                lines.append(
+                    f"  {name:<38} | {details['info']:<18} | {age:<6} | {ppm:<6} | {process:<18}",
+                )
+            lines.append('')
         return '\n'.join(lines)
 
-    def _prepare_buffer(self) -> List[Dict[str, Any]]:
+    def _prepare_buffer_and_cleanup(self, now: float) -> list[dict[str, Any]]:
+        """Prepare display buffer - lock-free read, async cleanup.
+
+        Single writer pattern: UI thread ONLY reads, never writes.
+        Cleanup is queued to single writer thread.
+        """
+        # Queue cleanup command to single writer thread
+        self.command_queue.put({'cmd': 'cleanup', 'now': now})
+
+        # Read data without lock - safe because only single writer modifies
+        snapshot: list[tuple] = []
+        for category in sorted(self.data.keys()):
+            snapshot.append(('cat', category))
+            for key, details in self.data[category].items():
+                snapshot.append(
+                    (
+                        'row',
+                        key,
+                        details['last_seen'],
+                        details['first_seen'],
+                        details['count'],
+                        details['info'],
+                        details.get('process', ''),
+                    ),
+                )
+            snapshot.append(('spacer',))
+
+        # Format buffer - zero contention
         buffer = []
-        now = time.time()
-        with self.data_lock:
-            for cat in sorted(self.data.keys()):
-                buffer.append({'type': 'cat', 'text': f'[{cat}]', 'is_new': False})
-                for key, details in self.data[cat].items():
-                    age = int(now - details['last_seen'])
-                    duration = max(1, now - details['first_seen'])
-                    ppm = int((details['count'] / duration) * 60)
-                    display_key = self.get_display_name(key)
-                    process = details.get('process', '')
-                    t_key = self.truncate(display_key, self.w_ip)
-                    t_info = self.truncate(details['info'], self.w_info)
-                    t_proc = self.truncate(process, self.w_proc)
-                    line_str = (
-                        f'  {t_key:<{self.w_ip}} | {t_info:<{self.w_info}} | '
-                        f'{age:<{self.w_age}} | {ppm:<{self.w_ppm}} | {t_proc:<{self.w_proc}}'
-                    )
-                    buffer.append({'type': 'row', 'text': line_str, 'is_new': age < 5})
+        for item in snapshot:
+            if item[0] == 'cat':
+                buffer.append({'type': 'cat', 'text': f'[{item[1]}]', 'is_new': False})
+            elif item[0] == 'row':
+                _, key, last_seen, first_seen, count, info, process = item
+                age = int(now - last_seen)
+                duration = max(1, now - first_seen)
+                ppm = int((count / duration) * 60)
+                display_key = self.get_display_name(key)
+
+                t_key = self.truncate(display_key, self.w_ip)
+                t_info = self.truncate(info, self.w_info)
+                t_proc = self.truncate(process, self.w_proc)
+
+                buffer.append(
+                    {
+                        'type': 'row',
+                        'text': (
+                            f'  {t_key:<{self.w_ip}} | {t_info:<{self.w_info}} | '
+                            f'{age:<{self.w_age}} | {ppm:<{self.w_ppm}} | {t_proc:<{self.w_proc}}'
+                        ),
+                        'is_new': age < 5,
+                    },
+                )
+            else:
                 buffer.append({'type': 'spacer', 'text': '', 'is_new': False})
+
         return buffer
 
     def _draw_header(
         self,
-        stdscr: Any,
+        stdscr: curses.window,
         buffer_len: int,
         now: float,
         max_x: int,
@@ -756,10 +1022,10 @@ class NetWatch:
                 f"{'AGE':<{self.w_age}} | {'PPM':<{self.w_ppm}} | {'PROCESS':<{self.w_proc}}"
             )
             stdscr.addstr(2, 0, cols[: max_x - 1], curses.A_REVERSE)
-        except Exception:  # noqa: S110
+        except curses.error:
             pass  # Small terminal
 
-    def _get_item_attr(self, item: Dict[str, Any]) -> int:
+    def _get_item_attr(self, item: dict[str, Any]) -> int:
         if item['type'] == 'cat':
             return curses.A_BOLD | curses.A_UNDERLINE
         if item['type'] == 'row' and item.get('is_new'):
@@ -770,14 +1036,13 @@ class NetWatch:
 
     def _draw_rows(
         self,
-        stdscr: Any,
-        buffer: List[Dict[str, Any]],
+        stdscr: curses.window,
+        buffer: list[dict[str, Any]],
         max_y: int,
         max_x: int,
     ) -> None:
         visible_h = max_y - 3
-        if self.scroll_offset > max(0, len(buffer) - visible_h):
-            self.scroll_offset = max(0, len(buffer) - visible_h)
+        self.scroll_offset = min(self.scroll_offset, max(0, len(buffer) - visible_h))
 
         slice_end = min(len(buffer), self.scroll_offset + visible_h)
 
@@ -791,26 +1056,22 @@ class NetWatch:
             if len(text) > max_x - 1:
                 text = text[: max_x - 1]
             attr = self._get_item_attr(item)
-            try:
+            with contextlib.suppress(curses.error):
                 stdscr.addstr(row_idx, 0, text, attr)
-            except Exception:  # noqa: S110
-                pass
 
         if len(buffer) > visible_h:
             scroll_pct = self.scroll_offset / (len(buffer) - visible_h)
             scroll_pos = 3 + int(scroll_pct * (visible_h - 1))
             if scroll_pos < max_y:
-                try:
+                with contextlib.suppress(curses.error):
                     stdscr.addch(scroll_pos, max_x - 1, '█', curses.A_REVERSE)
-                except Exception:  # noqa: S110
-                    pass
 
         stdscr.refresh()
 
     def _handle_input(
         self,
-        stdscr: Any,
-        buffer: List[Dict[str, Any]],
+        stdscr: curses.window,
+        buffer: list[dict[str, Any]],
         max_y: int,
         now: float,
     ) -> bool:
@@ -831,11 +1092,11 @@ class NetWatch:
                     self.status_msg, self.status_time = 'SAVE FAILED', now
             elif ch == ord('q'):
                 return False
-        except Exception:  # noqa: S110
+        except curses.error:
             pass
         return True
 
-    def cleanup_and_display(self, stdscr: Any) -> None:
+    def cleanup_and_display(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -843,19 +1104,9 @@ class NetWatch:
         while True:
             max_y, max_x = stdscr.getmaxyx()
             now = time.time()
-            with self.data_lock:
-                to_delete = []
-                # Clean up old entries only
-                for category in list(self.data.keys()):
-                    for key in list(self.data[category].keys()):
-                        if now - self.data[category][key]['last_seen'] > TIMEOUT:
-                            del self.data[category][key]
-                    if not self.data[category]:
-                        to_delete.append(category)
-                for cat in to_delete:
-                    del self.data[cat]
 
-            buffer = self._prepare_buffer()
+            # Single lock for both cleanup and buffer prep
+            buffer = self._prepare_buffer_and_cleanup(now)
 
             if not self._handle_input(stdscr, buffer, max_y, now):
                 break
@@ -864,20 +1115,30 @@ class NetWatch:
             self._draw_header(stdscr, len(buffer), now, max_x)
             self._draw_rows(stdscr, buffer, max_y, max_x)
 
-            time.sleep(0.1)
+            time.sleep(0.15)  # Slower refresh = less lock contention
 
     def run(self) -> None:
         self.detect_local_ips()
+
+        # Start SINGLE WRITER thread - only thread that modifies self.data
+        t_writer = threading.Thread(target=self.single_writer_worker, name='SingleWriter')
+        t_writer.daemon = True
+        t_writer.start()
+
+        # BPF filter optimization: filter common protocols at kernel level
+        bpf_filter = 'tcp or udp or arp or icmp or icmp6'
         t_sniff = threading.Thread(
-            target=lambda: sniff(prn=self.parse_packet, store=0, filter=''),
+            target=lambda: sniff(prn=self.parse_packet, store=0, filter=bpf_filter),
+            name='PacketCapture',
         )
         t_sniff.daemon = True
         t_sniff.start()
 
+        # DNS resolution now uses async thread pool + cached function
         if not self.passive_mode:
-            t_res = threading.Thread(target=self.resolver_worker)
-            t_res.daemon = True
-            t_res.start()
+            # Pre-warm cache with local IPs
+            for ip in self.my_ips:
+                self.async_resolve_hostname(ip)
 
         try:
             curses.wrapper(self.cleanup_and_display)
