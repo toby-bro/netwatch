@@ -3,7 +3,9 @@ import argparse
 import curses
 import logging
 import os
+import re
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -50,9 +52,14 @@ class NetWatch:
         self.resolved_lock = threading.Lock()
         self.resolver_queue: Queue[str] = Queue()
 
+        # Process Resolution
+        self.port_to_process: Dict[str, str] = {}  # Maps "proto:port" -> "process_name"
+        self.process_lock = threading.Lock()
+        self.last_process_scan = 0.0
+
         # Display constants
-        self.w_ip, self.w_info, self.w_age, self.w_ppm = 45, 20, 6, 6
-        self.cols_width = self.w_ip + self.w_info + self.w_age + self.w_ppm + 9  # pipe chars
+        self.w_ip, self.w_info, self.w_age, self.w_ppm, self.w_proc = 38, 18, 6, 6, 18
+        self.cols_width = self.w_ip + self.w_info + self.w_age + self.w_ppm + self.w_proc + 13  # pipe chars
 
     def get_mac_vendor(self, mac: str) -> str:
         if mac.startswith(('00:04:96', '00:e0:2b')):
@@ -109,6 +116,70 @@ class NetWatch:
             return next(iter(self.my_ips))
         return self.ip_activity.most_common(1)[0][0]
 
+    def scan_processes(self) -> None:
+        """Scan local ports and map them to process names using ss command."""
+        try:
+            # Use ss to get all listening and established connections with process info
+            # -tulpn: tcp, udp, listening, process, numeric
+            # -a: all sockets
+            result = subprocess.run(
+                ['/usr/bin/ss', '-lntup'],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                return
+
+            port_map = {}
+            for line in result.stdout.split('\n'):
+                # Parse ss output: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+                # Example: tcp ESTAB 0 0 192.168.1.100:45678 1.2.3.4:443 users:(("firefox",...))
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+
+                proto = parts[0].lower()
+                if proto not in ['tcp', 'udp']:
+                    continue
+
+                # Extract local port
+                local_addr = parts[4]
+                if ':' in local_addr:
+                    port = local_addr.rsplit(':', 1)[1]
+                    if port == '*':
+                        continue
+
+                    # Extract process name
+                    process = 'Unknown'
+                    if len(parts) > 6:
+                        # Process info is in the last field, format: users:(("name",pid=123,fd=4))
+                        proc_info = ' '.join(parts[6:])
+                        match = re.search(r'"([^"]+)"', proc_info)
+                        if match:
+                            process = match.group(1)
+
+                    key = f'{proto}:{port}'
+                    port_map[key] = process
+
+            with self.process_lock:
+                self.port_to_process = port_map
+                self.last_process_scan = time.time()
+        except Exception:
+            logging.error('Error scanning processes', exc_info=True)
+
+    def get_process_for_port(self, proto: str, port: str) -> str:
+        """Get the process name for a given protocol and port."""
+        # Rescan every 5 seconds
+        if time.time() - self.last_process_scan > 5:
+            self.scan_processes()
+
+        with self.process_lock:
+            key = f'{proto.lower()}:{port}'
+            return self.port_to_process.get(key, '')
+
     def resolver_worker(self) -> None:
         while True:
             try:
@@ -128,16 +199,24 @@ class NetWatch:
             except Exception:
                 logging.error('Error in resolver worker', exc_info=True)
 
-    def update_entry(self, category: str, key: str, info: str) -> None:
+    def update_entry(self, category: str, key: str, info: str, process: str = '') -> None:
         now = time.time()
         with self.data_lock:
             if key not in self.data[category]:
-                self.data[category][key] = {'last_seen': now, 'first_seen': now, 'count': 0, 'info': info}
+                self.data[category][key] = {
+                    'last_seen': now,
+                    'first_seen': now,
+                    'count': 0,
+                    'info': info,
+                    'process': process,
+                }
             entry = self.data[category][key]
             entry['last_seen'] = now
             entry['count'] += 1
             if entry['info'] == 'Multicast DNS' and info != 'Multicast DNS':
                 entry['info'] = info
+            if process and not entry.get('process'):
+                entry['process'] = process
 
     def _extract_name_from_rr(self, rr: Any) -> Optional[str]:
         extracted = None
@@ -261,27 +340,44 @@ class NetWatch:
 
     def _handle_active_connections(self, pkt: Any, src_ip: Optional[str], dst_ip: Optional[str]) -> None:
         if src_ip and dst_ip:
+            # Skip packets handled by specific protocol handlers
             if pkt.haslayer(UDP) and pkt.dport in [5353, 1900, 5355, 137, 27036]:
+                return
+            if pkt.haslayer(UDP) and pkt.sport in [5353]:  # Also skip mDNS responses
                 return
 
             is_ignored = False
             if dst_ip.endswith('.255') or dst_ip.startswith(('224.', '239.', 'ff02:')):
                 is_ignored = True
 
-            proto = 'TCP' if pkt.haslayer(TCP) else 'UDP' if pkt.haslayer(UDP) else 'IP'
+            proto = 'tcp' if pkt.haslayer(TCP) else 'udp' if pkt.haslayer(UDP) else 'ip'
             port = ''
+            local_port = ''
             p_info = ''
+            process = ''
 
             if pkt.haslayer(TCP):
-                port = f':{pkt[TCP].dport}' if src_ip in self.my_ips else f':{pkt[TCP].sport}'
+                if src_ip in self.my_ips:
+                    port = f':{pkt[TCP].dport}'
+                    local_port = str(pkt[TCP].sport)
+                else:
+                    port = f':{pkt[TCP].sport}'
+                    local_port = str(pkt[TCP].dport)
                 p_info = f':{pkt[TCP].sport} > :{pkt[TCP].dport}'
+                process = self.get_process_for_port('tcp', local_port)
             elif pkt.haslayer(UDP):
-                port = f':{pkt[UDP].dport}' if src_ip in self.my_ips else f':{pkt[UDP].sport}'
+                if src_ip in self.my_ips:
+                    port = f':{pkt[UDP].dport}'
+                    local_port = str(pkt[UDP].sport)
+                else:
+                    port = f':{pkt[UDP].sport}'
+                    local_port = str(pkt[UDP].dport)
                 p_info = f':{pkt[UDP].sport} > :{pkt[UDP].dport}'
+                process = self.get_process_for_port('udp', local_port)
 
             if is_ignored:
                 key = f'{src_ip} > {dst_ip}'
-                self.update_entry('~ Ignored / Broadcast', key, f'{proto} {p_info}')
+                self.update_entry('~ Ignored / Broadcast', key, f'{proto.upper()} {p_info}', process)
                 return
 
             is_my_src = src_ip in self.my_ips
@@ -291,10 +387,10 @@ class NetWatch:
                 other_ip = dst_ip if is_my_src else src_ip
                 if not self.passive_mode and '.' in other_ip:
                     self.resolver_queue.put(other_ip)
-                self.update_entry('Active_Connections', f'{other_ip}{port}', f'{proto} Traffic')
+                self.update_entry('Active_Connections', f'{other_ip}{port}', f'{proto.upper()} Traffic', process)
             else:
                 key = f'{src_ip} > {dst_ip}'
-                self.update_entry('~ Unclassified / Other Traffic', key, f'{proto} {p_info}')
+                self.update_entry('~ Unclassified / Other Traffic', key, f'{proto.upper()} {p_info}', process)
 
     def parse_packet(self, pkt: Any) -> None:
         src_ip = None
@@ -362,8 +458,8 @@ class NetWatch:
 
     def generate_table_string(self) -> str:
         lines = []
-        lines.append(f"{'DEVICE / IP':<45} | {'INFO':<20} | {'AGE':<6} | {'PPM':<6}")
-        lines.append('-' * 85)
+        lines.append(f"{'DEVICE / IP':<38} | {'INFO':<18} | {'AGE':<6} | {'PPM':<6} | {'PROCESS':<18}")
+        lines.append('-' * 100)
         with self.data_lock:
             now = time.time()
             for cat in sorted(self.data.keys()):
@@ -373,7 +469,10 @@ class NetWatch:
                     age = int(now - details['last_seen'])
                     duration = max(1, now - details['first_seen'])
                     ppm = int((details['count'] / duration) * 60)
-                    lines.append(f"  {name:<45} | {details['info']:<20} | {age:<6} | {ppm:<6}")
+                    process = details.get('process', '')
+                    lines.append(
+                        f"  {name:<38} | {details['info']:<18} | {age:<6} | {ppm:<6} | {process:<18}",
+                    )
                 lines.append('')
         return '\n'.join(lines)
 
@@ -388,10 +487,13 @@ class NetWatch:
                     duration = max(1, now - details['first_seen'])
                     ppm = int((details['count'] / duration) * 60)
                     display_key = self.get_display_name(key)
+                    process = details.get('process', '')
                     t_key = self.truncate(display_key, self.w_ip)
                     t_info = self.truncate(details['info'], self.w_info)
+                    t_proc = self.truncate(process, self.w_proc)
                     line_str = (
-                        f'  {t_key:<{self.w_ip}} | {t_info:<{self.w_info}} | {age:<{self.w_age}} | {ppm:<{self.w_ppm}}'
+                        f'  {t_key:<{self.w_ip}} | {t_info:<{self.w_info}} | '
+                        f'{age:<{self.w_age}} | {ppm:<{self.w_ppm}} | {t_proc:<{self.w_proc}}'
                     )
                     buffer.append({'type': 'row', 'text': line_str, 'is_new': age < 5})
                 buffer.append({'type': 'spacer', 'text': '', 'is_new': False})
@@ -416,7 +518,7 @@ class NetWatch:
             )
             cols = (
                 f"  {'DEVICE / IP':<{self.w_ip}} | {'INFO':<{self.w_info}} | "
-                f"{'AGE':<{self.w_age}} | {'PPM':<{self.w_ppm}}"
+                f"{'AGE':<{self.w_age}} | {'PPM':<{self.w_ppm}} | {'PROCESS':<{self.w_proc}}"
             )
             stdscr.addstr(2, 0, cols[: max_x - 1], curses.A_REVERSE)
         except Exception:  # noqa: S110
