@@ -119,11 +119,14 @@ class NetWatch:
     def scan_processes(self) -> None:
         """Scan local ports and map them to process names using ss command."""
         try:
-            # Use ss to get all listening and established connections with process info
-            # -tulpn: tcp, udp, listening, process, numeric
-            # -a: all sockets
+            # Use ss to get all connections (listening + established) with process info
+            # -a: all sockets (listening and established)
+            # -n: numeric (don't resolve names)
+            # -t: TCP sockets
+            # -u: UDP sockets
+            # -p: show process information
             result = subprocess.run(
-                ['/usr/bin/ss', '-lntup'],
+                ['/usr/bin/ss', '-antup'],
                 capture_output=True,
                 text=True,
                 timeout=2,
