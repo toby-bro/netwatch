@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import curses
+import functools
 import logging
 import os
 import re
@@ -11,7 +12,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from queue import Empty, Queue
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 from typing import Any, DefaultDict, Dict, List, Optional, Set
 
 from scapy.all import get_if_addr, get_if_list, sniff
@@ -35,6 +36,49 @@ TIMEOUT = 60  # Memory duration in seconds
 PRIVATE_IP_PATTERN = re.compile(
     r'^(?:10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)',
 )
+
+
+@functools.lru_cache(maxsize=512)
+def is_private_ip_cached(ip: str) -> bool:
+    """Cached check if IP is in RFC1918 private address space."""
+    return PRIVATE_IP_PATTERN.match(ip) is not None
+
+
+@functools.lru_cache(maxsize=256)
+def clean_mdns_name_cached(name: str) -> Optional[str]:
+    """Cached clean mDNS name. Takes string only for caching."""
+    try:
+        if name.endswith('.'):
+            name = name[:-1]
+
+        # Extract the human part from "Name._service._tcp.local"
+        if '._' in name:
+            name = name.split('._')[0]
+
+        if name.endswith('.local'):
+            name = name[:-6]
+
+        # Cleanup quotes sometimes found in TXT/Strings
+        name = name.strip('"')
+
+        if len(name) < 2 or name.startswith('_'):
+            return None
+        return name
+    except Exception:
+        logging.error('Error cleaning mDNS name', exc_info=True)
+        return None
+
+
+@functools.lru_cache(maxsize=128)
+def get_mac_vendor(mac: str) -> str:
+    """Get MAC vendor information."""
+    if mac.startswith(('00:04:96', '00:e0:2b')):
+        return 'Extreme Networks'
+    if mac.startswith('0e:'):
+        return 'Extreme Protocol (EDP)'
+    if 'cisco' in mac.lower():
+        return 'Cisco'
+    return 'Unknown Vendor'
 
 
 class PerformanceMonitor:
@@ -102,16 +146,7 @@ class NetWatch:
     @staticmethod
     def is_private_ip(ip: str) -> bool:
         """Check if IP is in RFC1918 private address space."""
-        return PRIVATE_IP_PATTERN.match(ip) is not None
-
-    def get_mac_vendor(self, mac: str) -> str:
-        if mac.startswith(('00:04:96', '00:e0:2b')):
-            return 'Extreme Networks'
-        if mac.startswith('0e:'):
-            return 'Extreme Protocol (EDP)'
-        if 'cisco' in mac.lower():
-            return 'Cisco'
-        return 'Unknown Vendor'
+        return is_private_ip_cached(ip)
 
     def clean_mdns_name(self, name_input: Any) -> Optional[str]:
         try:
@@ -120,25 +155,9 @@ class NetWatch:
                 name = name_input.decode('utf-8', errors='ignore')
             else:
                 name = str(name_input)
-
-            if name.endswith('.'):
-                name = name[:-1]
-
-            # Extract the human part from "Name._service._tcp.local"
-            if '._' in name:
-                name = name.split('._')[0]
-
-            if name.endswith('.local'):
-                name = name[:-6]
-
-            # Cleanup quotes sometimes found in TXT/Strings
-            name = name.strip('"')
-
-            if len(name) < 2 or name.startswith('_'):
-                return None
-            return name
+            return clean_mdns_name_cached(name)
         except Exception:
-            logging.error('Error cleaning mDNS name', exc_info=True)
+            logging.error('Error cleaning mDNS name wrapper', exc_info=True)
             return None
 
     def detect_local_ips(self) -> None:
@@ -392,7 +411,7 @@ class NetWatch:
     def _handle_infra(self, pkt: Packet) -> None:
         if pkt.haslayer(Ether):
             mac_src = pkt[Ether].src
-            vendor = self.get_mac_vendor(mac_src)
+            vendor = get_mac_vendor(mac_src)
             if 'Extreme' in vendor or mac_src.startswith('0e:'):
                 self.update_entry('Infrastructure', mac_src, vendor)
             if pkt.haslayer('Dot3') or pkt.type == 0x88CC:
