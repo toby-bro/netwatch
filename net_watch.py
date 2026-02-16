@@ -37,6 +37,35 @@ PRIVATE_IP_PATTERN = re.compile(
 )
 
 
+class PerformanceMonitor:
+    """Track packet processing performance."""
+
+    def __init__(self) -> None:
+        self.packet_count = 0
+        self.start_time = time.time()
+        self.process_times: list[float] = []
+
+    def record_packet(self, process_time: float) -> None:
+        """Record a packet processing time."""
+        self.packet_count += 1
+        self.process_times.append(process_time)
+        # Keep only last 1000 samples
+        if len(self.process_times) > 1000:
+            self.process_times.pop(0)
+
+    def get_stats(self) -> dict[str, float]:
+        """Get performance statistics."""
+        if not self.process_times:
+            return {'pps': 0.0, 'avg_ms': 0.0, 'max_ms': 0.0}
+
+        elapsed = time.time() - self.start_time
+        pps = self.packet_count / elapsed if elapsed > 0 else 0.0
+        avg_ms = sum(self.process_times) / len(self.process_times) * 1000
+        max_ms = max(self.process_times) * 1000
+
+        return {'pps': pps, 'avg_ms': avg_ms, 'max_ms': max_ms}
+
+
 class NetWatch:
     def __init__(self, passive_mode: bool, show_questions: bool):
         self.passive_mode = passive_mode
@@ -51,9 +80,7 @@ class NetWatch:
 
         # IP Management
         self.my_ips: Set[str] = set()
-        self.ip_activity: Counter[str] = (
-            Counter()
-        )  # Track packet count to find "Main" IP
+        self.ip_activity: Counter[str] = Counter()  # Track packet count to find "Main" IP
 
         # Name Resolution
         self.resolved_names: Dict[str, Optional[str]] = {}
@@ -67,9 +94,10 @@ class NetWatch:
 
         # Display constants
         self.w_ip, self.w_info, self.w_age, self.w_ppm, self.w_proc = 38, 18, 6, 6, 18
-        self.cols_width = (
-            self.w_ip + self.w_info + self.w_age + self.w_ppm + self.w_proc + 13
-        )  # pipe chars
+        self.cols_width = self.w_ip + self.w_info + self.w_age + self.w_ppm + self.w_proc + 13  # pipe chars
+
+        # Performance monitoring
+        self.perf_monitor = PerformanceMonitor()
 
     @staticmethod
     def is_private_ip(ip: str) -> bool:
@@ -223,7 +251,11 @@ class NetWatch:
                 logging.error('Error in resolver worker', exc_info=True)
 
     def update_entry(
-        self, category: str, key: str, info: str, process: str = '',
+        self,
+        category: str,
+        key: str,
+        info: str,
+        process: str = '',
     ) -> None:
         now = time.time()
         with self.data_lock:
@@ -282,7 +314,9 @@ class NetWatch:
                 qname = self.clean_mdns_name(q_rr.qname)
                 if qname:
                     self.update_entry(
-                        'mDNS Questions (Missing?)', f'{qname} [?]', f'Sought by {sip}',
+                        'mDNS Questions (Missing?)',
+                        f'{qname} [?]',
+                        f'Sought by {sip}',
                     )
                 q_rr = q_rr.payload
 
@@ -298,7 +332,11 @@ class NetWatch:
         return category, info
 
     def _process_dns_layer(
-        self, pkt: Packet, sip: str, initial_category: str, initial_info: str,
+        self,
+        pkt: Packet,
+        sip: str,
+        initial_category: str,
+        initial_info: str,
     ) -> None:
         dns_layer = pkt.getlayer(DNS)
         if not dns_layer:
@@ -378,7 +416,9 @@ class NetWatch:
         return port, local_port, p_info, process
 
     def _extract_udp_info(
-        self, pkt: Packet, src_ip: str,
+        self,
+        pkt: Packet,
+        src_ip: str,
     ) -> tuple[str, str, str, str, bool]:
         """Extract UDP connection info and DNS flag."""
         is_my_src = src_ip in self.my_ips
@@ -408,7 +448,10 @@ class NetWatch:
         if is_local_dns:
             # Group all local DNS into a single entry
             self.update_entry(
-                'DNS Queries (Local)', 'Local DNS', 'Local DNS Queries', 'Various',
+                'DNS Queries (Local)',
+                'Local DNS',
+                'Local DNS Queries',
+                'Various',
             )
         else:
             # Show detailed port-to-port info for other IPC
@@ -417,11 +460,17 @@ class NetWatch:
             dst_name = dst_process if dst_process else 'unknown'
             process_flow = f'{src_name} → {dst_name}'
             self.update_entry(
-                'Local Inter-Process', key, f'{proto.upper()} IPC', process_flow,
+                'Local Inter-Process',
+                key,
+                f'{proto.upper()} IPC',
+                process_flow,
             )
 
     def _handle_active_connections(
-        self, pkt: Packet, src_ip: Optional[str], dst_ip: Optional[str],
+        self,
+        pkt: Packet,
+        src_ip: Optional[str],
+        dst_ip: Optional[str],
     ) -> None:
         if not (src_ip and dst_ip):
             return
@@ -512,6 +561,15 @@ class NetWatch:
             )
 
     def parse_packet(self, pkt: Packet) -> None:
+        """Parse a packet and update state."""
+        start_time = time.time()
+        try:
+            self._parse_packet_internal(pkt)
+        finally:
+            self.perf_monitor.record_packet(time.time() - start_time)
+
+    def _parse_packet_internal(self, pkt: Packet) -> None:
+        """Internal packet parsing logic."""
         src_ip = None
         dst_ip = None
 
@@ -523,20 +581,10 @@ class NetWatch:
             dst_ip = pkt[IPv6].dst
 
         # Add local network IPs to my_ips set
-        if (
-            src_ip
-            and src_ip not in self.my_ips
-            and '.' in src_ip
-            and self.is_private_ip(src_ip)
-        ):
+        if src_ip and src_ip not in self.my_ips and '.' in src_ip and self.is_private_ip(src_ip):
             self.my_ips.add(src_ip)
 
-        if (
-            dst_ip
-            and dst_ip not in self.my_ips
-            and '.' in dst_ip
-            and self.is_private_ip(dst_ip)
-        ):
+        if dst_ip and dst_ip not in self.my_ips and '.' in dst_ip and self.is_private_ip(dst_ip):
             self.my_ips.add(dst_ip)
 
         if src_ip:
@@ -657,7 +705,11 @@ class NetWatch:
         return buffer
 
     def _draw_header(
-        self, stdscr: Any, buffer_len: int, now: float, max_x: int,
+        self,
+        stdscr: Any,
+        buffer_len: int,
+        now: float,
+        max_x: int,
     ) -> None:
         try:
             mode_str = 'Passive' if self.passive_mode else 'Active'
@@ -674,12 +726,12 @@ class NetWatch:
                     curses.A_REVERSE | curses.A_BOLD,
                 )
 
-            stdscr.addstr(
-                1,
-                0,
-                f'Main IP: {main_ip} (Total IPs: {len(self.my_ips)}) | Timeout: {TIMEOUT}s | Items: {buffer_len}',
-                curses.A_DIM,
-            )
+            # Add performance stats
+            perf_stats = self.perf_monitor.get_stats()
+            perf_info = f'Main IP: {main_ip} | Items: {buffer_len} | '
+            perf_info += f"PPS: {perf_stats['pps']:.1f} | Avg: {perf_stats['avg_ms']:.2f}ms | "
+            perf_info += f"Max: {perf_stats['max_ms']:.1f}ms"
+            stdscr.addstr(1, 0, perf_info[: max_x - 1], curses.A_DIM)
             cols = (
                 f"  {'DEVICE / IP':<{self.w_ip}} | {'INFO':<{self.w_info}} | "
                 f"{'AGE':<{self.w_age}} | {'PPM':<{self.w_ppm}} | {'PROCESS':<{self.w_proc}}"
@@ -698,7 +750,11 @@ class NetWatch:
         return curses.A_NORMAL
 
     def _draw_rows(
-        self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, max_x: int,
+        self,
+        stdscr: Any,
+        buffer: List[Dict[str, Any]],
+        max_y: int,
+        max_x: int,
     ) -> None:
         visible_h = max_y - 3
         if self.scroll_offset > max(0, len(buffer) - visible_h):
@@ -733,7 +789,11 @@ class NetWatch:
         stdscr.refresh()
 
     def _handle_input(
-        self, stdscr: Any, buffer: List[Dict[str, Any]], max_y: int, now: float,
+        self,
+        stdscr: Any,
+        buffer: List[Dict[str, Any]],
+        max_y: int,
+        now: float,
     ) -> bool:
         try:
             ch = stdscr.getch()
