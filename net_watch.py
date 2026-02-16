@@ -431,19 +431,21 @@ class NetWatch:
                         if sport == 53 or dport == 53:
                             is_local_dns = True
 
-                    # Create descriptive key and process info
-                    key = f':{sport} > :{dport}'
-                    src_name = src_process if src_process else 'unknown'
-                    dst_name = dst_process if dst_process else 'unknown'
-                    process_flow = f'{src_name} → {dst_name}'
-
                     # Categorize based on whether it's DNS or other IPC
                     if is_local_dns:
+                        # Group all local DNS into a single entry
                         category = 'DNS Queries (Local)'
-                        info = 'Local DNS'
+                        key = 'Local DNS'
+                        info = 'Local DNS Queries'
+                        process_flow = 'Various'
                     else:
+                        # Show detailed port-to-port info for other IPC
                         category = 'Local Inter-Process'
+                        key = f':{sport} > :{dport}'
                         info = f'{proto.upper()} IPC'
+                        src_name = src_process if src_process else 'unknown'
+                        dst_name = dst_process if dst_process else 'unknown'
+                        process_flow = f'{src_name} → {dst_name}'
 
                     # Show inter-process local traffic with both processes
                     self.update_entry(category, key, info, process_flow)
