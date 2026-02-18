@@ -28,4 +28,10 @@ This was scriptted in an attempt to know
 - Determines the process responsible for each communication
 - Tries to be efficient (atomic replacement of data to prevent locks) without being CPU intensive (sleeps most of the time)
 
-It needs to run with sudo privileges
+## Good to know
+
+- It needs to run with sudo privileges
+- Part of this project was vibe-coded
+- It is provided under a [MIT LICENSE](./LICENSE)
+- A fair amount of time was spent on profiling the program to identify how to make it as efficient as possible
+- If people are interested in this project I might make a cleaner version in a compiled language
